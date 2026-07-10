@@ -60,14 +60,32 @@ async def upload_reference(payload: ImageUpload) -> ReferenceUploadResult:
 
 @app.post("/api/app/compare", response_model=SimilarityResult)
 async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
-    reference = reference_images.get(payload.car_id)
+    reference = None
     reference_source = "cache"
-    if reference is None and settings.edge_frame_url:
-        reference = fetch_edge_frame(settings.edge_frame_url)
-        reference_images[payload.car_id] = reference
-        reference_source = "edge_frame_url"
+    if settings.edge_frame_url:
+        try:
+            reference = fetch_edge_frame(settings.edge_frame_url)
+            reference_source = "edge_frame_url"
+        except Exception as exc:
+            return SimilarityResult(
+                ok=False,
+                car_id=payload.car_id,
+                similarity=0.0,
+                matched=False,
+                threshold=0.45,
+                method="none",
+                server_latency_ms=0.0,
+                yolo_summary={
+                    "error": f"failed to fetch edge frame from EDGE_FRAME_URL: {exc}",
+                    "edge_frame_url": settings.edge_frame_url,
+                },
+                reference_source="edge_frame_url_error",
+            )
+    else:
+        reference = reference_images.get(payload.car_id)
 
     if reference is None:
+        error = "no reference image uploaded and EDGE_FRAME_URL is empty"
         return SimilarityResult(
             ok=False,
             car_id=payload.car_id,
@@ -76,7 +94,7 @@ async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
             threshold=0.45,
             method="none",
             server_latency_ms=0.0,
-            yolo_summary={"error": "no reference image uploaded for this car_id"},
+            yolo_summary={"error": error},
             reference_source="none",
         )
 
