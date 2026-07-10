@@ -34,3 +34,26 @@ class InferenceResult(BaseModel):
     server_latency_ms: float
     detections: list[Detection] = Field(default_factory=list)
 
+
+class ImageUpload(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    image: ImagePayload
+
+
+class ReferenceUploadResult(BaseModel):
+    ok: bool = True
+    car_id: str
+    width: int
+    height: int
+    message: str
+
+
+class SimilarityResult(BaseModel):
+    ok: bool = True
+    car_id: str
+    similarity: float
+    matched: bool
+    threshold: float
+    method: str
+    server_latency_ms: float
+    yolo_summary: dict = Field(default_factory=dict)

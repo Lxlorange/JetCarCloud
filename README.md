@@ -106,3 +106,35 @@ python scripts/send_test_frame.py \
   --image /path/to/test.jpg
 ```
 
+## Similarity Workflow
+
+1. Start JetCarCloud.
+2. Upload a simulated camera/reference frame from JetCarEdge.
+3. In the mobile app, open the third tab, choose a gallery image, and upload it
+   for comparison.
+
+HTTP APIs:
+
+```text
+POST /api/edge/reference
+POST /api/app/compare
+```
+
+Both accept this JSON shape:
+
+```json
+{
+  "car_id": "car_001",
+  "image": {
+    "encoding": "jpeg",
+    "width": 640,
+    "height": 480,
+    "data": "base64-jpeg"
+  }
+}
+```
+
+The comparison response includes `similarity`, `matched`, `threshold`,
+`server_latency_ms`, and a YOLO label summary. If no `YOLO_MODEL_PATH` is set,
+the service still runs OpenCV feature cosine similarity and reports YOLO as
+unavailable.
