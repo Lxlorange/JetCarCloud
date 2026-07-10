@@ -57,3 +57,4 @@ class SimilarityResult(BaseModel):
     method: str
     server_latency_ms: float
     yolo_summary: dict = Field(default_factory=dict)
+    reference_source: str = "cache"

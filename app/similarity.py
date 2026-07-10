@@ -40,20 +40,26 @@ def extract_feature_vector(image_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
-    hog = cv2.HOGDescriptor(
-        _winSize=(160, 160),
-        _blockSize=(16, 16),
-        _blockStride=(8, 8),
-        _cellSize=(8, 8),
-        _nbins=9,
-    )
-    hog_feature = unit_normalize(hog.compute(gray).reshape(-1))
+    if hasattr(cv2, "HOGDescriptor"):
+        hog = cv2.HOGDescriptor(
+            _winSize=(160, 160),
+            _blockSize=(16, 16),
+            _blockStride=(8, 8),
+            _cellSize=(8, 8),
+            _nbins=9,
+        )
+        shape_feature = unit_normalize(hog.compute(gray).reshape(-1))
+    else:
+        # Some minimal OpenCV builds do not expose HOGDescriptor. Keep the
+        # pipeline available with a compact grayscale shape descriptor.
+        shape_feature = cv2.resize(gray, (48, 48), interpolation=cv2.INTER_AREA).reshape(-1)
+        shape_feature = unit_normalize(shape_feature)
 
     edges = cv2.Canny(gray, 80, 160)
     edge_feature = cv2.resize(edges, (32, 32), interpolation=cv2.INTER_AREA).reshape(-1)
     edge_feature = unit_normalize(edge_feature)
 
-    return unit_normalize(np.concatenate([color_feature, hog_feature * 1.5, edge_feature]))
+    return unit_normalize(np.concatenate([color_feature, shape_feature * 1.5, edge_feature]))
 
 
 def cosine_similarity(feature_a: np.ndarray, feature_b: np.ndarray) -> float:

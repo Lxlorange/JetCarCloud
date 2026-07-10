@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
@@ -38,6 +39,7 @@ async def health() -> dict:
         "service": settings.app_name,
         "detector": detector.__class__.__name__,
         "connections": await manager.stats(),
+        "edge_frame_url": settings.edge_frame_url,
     }
 
 
@@ -56,6 +58,12 @@ async def upload_reference(payload: ImageUpload) -> ReferenceUploadResult:
 @app.post("/api/app/compare", response_model=SimilarityResult)
 async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
     reference = reference_images.get(payload.car_id)
+    reference_source = "cache"
+    if reference is None and settings.edge_frame_url:
+        reference = fetch_edge_frame(settings.edge_frame_url)
+        reference_images[payload.car_id] = reference
+        reference_source = "edge_frame_url"
+
     if reference is None:
         return SimilarityResult(
             ok=False,
@@ -66,6 +74,7 @@ async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
             method="none",
             server_latency_ms=0.0,
             yolo_summary={"error": "no reference image uploaded for this car_id"},
+            reference_source="none",
         )
 
     query = decode_jpeg(payload.image)
@@ -78,7 +87,26 @@ async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
         method=result.method,
         server_latency_ms=result.latency_ms,
         yolo_summary=result.yolo_summary,
+        reference_source=reference_source,
     )
+
+
+def fetch_edge_frame(url: str):
+    response = requests.get(url, timeout=(3, 10))
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload = ImageUpload.model_validate(response.json())
+        return decode_jpeg(payload.image)
+
+    import cv2
+    import numpy as np
+
+    array = np.frombuffer(response.content, dtype=np.uint8)
+    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"edge frame response is not a decodable image: {url}")
+    return image
 
 
 @app.websocket("/ws/inference/{car_id}/edge")

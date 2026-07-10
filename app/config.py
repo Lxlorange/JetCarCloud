@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     yolo_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     yolo_image_size: int = Field(default=640, ge=64)
     app_result_history: int = Field(default=1, ge=0, le=10)
+    edge_frame_url: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
@@ -22,4 +23,3 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
-

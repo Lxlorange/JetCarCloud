@@ -108,10 +108,32 @@ python scripts/send_test_frame.py \
 
 ## Similarity Workflow
 
-1. Start JetCarCloud.
-2. Upload a simulated camera/reference frame from JetCarEdge.
+1. Start JetCarEdge mock camera server.
+2. Start JetCarCloud with `EDGE_FRAME_URL` pointing to that server.
 3. In the mobile app, open the third tab, choose a gallery image, and upload it
    for comparison.
+
+Mock edge camera:
+
+```bash
+cd /path/to/JetCarEdge
+python scripts/mock_camera_server.py \
+  --host 0.0.0.0 \
+  --port 8100 \
+  --image ../yolov5-7.0/data/images/bus.jpg
+```
+
+Cloud:
+
+```bash
+EDGE_FRAME_URL=http://127.0.0.1:8100/api/frame \
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+If the edge mock camera runs on another machine, replace `127.0.0.1` with that
+machine's LAN IP. The older `POST /api/edge/reference` flow still works, but
+`EDGE_FRAME_URL` is closer to the future video-frame design: the app triggers a
+comparison, and the cloud fetches the current frame from the car side.
 
 HTTP APIs:
 
@@ -135,6 +157,6 @@ Both accept this JSON shape:
 ```
 
 The comparison response includes `similarity`, `matched`, `threshold`,
-`server_latency_ms`, and a YOLO label summary. If no `YOLO_MODEL_PATH` is set,
-the service still runs OpenCV feature cosine similarity and reports YOLO as
-unavailable.
+`server_latency_ms`, `reference_source`, and a YOLO label summary. If no
+`YOLO_MODEL_PATH` is set, the service still runs OpenCV feature cosine
+similarity and reports YOLO as unavailable.
