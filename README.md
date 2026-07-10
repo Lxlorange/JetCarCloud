@@ -54,9 +54,23 @@ cp .env.example .env
 If you already have a YOLOv5 or YOLOv8 weight file, edit `.env`:
 
 ```bash
+YOLO_BACKEND=yolov5
+YOLO_MODEL_PATH=/path/to/yolov5s.pt
+YOLOV5_REPO_PATH=/path/to/yolov5-7.0
+YOLO_DEVICE=cpu
+```
+
+For YOLOv8/Ultralytics-format weights, use:
+
+```bash
+YOLO_BACKEND=ultralytics
 YOLO_MODEL_PATH=/path/to/best.pt
 YOLO_DEVICE=cpu
 ```
+
+If model loading fails, the service now falls back to OpenCV feature similarity
+instead of failing to start. Check `/health` for `detector` and
+`detector_reason`.
 
 Start the service:
 

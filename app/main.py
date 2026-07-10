@@ -23,6 +23,8 @@ settings = get_settings()
 manager = ConnectionManager(history_size=settings.app_result_history)
 detector = build_detector(
     settings.yolo_model_path,
+    backend=settings.yolo_backend,
+    yolov5_repo_path=settings.yolov5_repo_path,
     device=settings.yolo_device,
     confidence=settings.yolo_confidence,
     image_size=settings.yolo_image_size,
@@ -38,6 +40,7 @@ async def health() -> dict:
         "ok": True,
         "service": settings.app_name,
         "detector": detector.__class__.__name__,
+        "detector_reason": getattr(detector, "reason", ""),
         "connections": await manager.stats(),
         "edge_frame_url": settings.edge_frame_url,
     }

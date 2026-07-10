@@ -10,7 +10,9 @@ class Settings(BaseSettings):
     app_name: str = "JetCarCloud"
     host: str = "0.0.0.0"
     port: int = 8000
+    yolo_backend: str = "auto"
     yolo_model_path: str = ""
+    yolov5_repo_path: str = ""
     yolo_device: str = "cpu"
     yolo_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
     yolo_image_size: int = Field(default=640, ge=64)

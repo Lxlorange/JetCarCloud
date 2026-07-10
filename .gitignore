@@ -18,3 +18,4 @@ weights/
 *.png
 !README.md
 
+/models
