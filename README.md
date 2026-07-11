@@ -174,3 +174,40 @@ The comparison response includes `similarity`, `matched`, `threshold`,
 `server_latency_ms`, `reference_source`, and a YOLO label summary. If no
 `YOLO_MODEL_PATH` is set, the service still runs OpenCV feature cosine
 similarity and reports YOLO as unavailable.
+
+## Video Stream Foundation
+
+Cloud now has a basic video-stream layer for future camera and AI features. The
+car can later expose RTSP, HTTP MJPEG, or another URL readable by the cloud
+process. For now, register a stream with assumed parameters:
+
+```bash
+python scripts/register_video_stream.py \
+  --cloud http://127.0.0.1:8000 \
+  --car-id car_001 \
+  --stream-id camera_front \
+  --url rtsp://192.168.10.50:8554/camera \
+  --transport rtsp \
+  --width 640 \
+  --height 640
+```
+
+Useful endpoints:
+
+```text
+POST /api/video/streams
+GET  /api/video/streams
+POST /api/video/streams/{car_id}/{stream_id}/preprocess
+POST /api/video/streams/{car_id}/{stream_id}/tasks/yolo_detection/run-once
+POST /api/video/streams/{car_id}/{stream_id}/start
+POST /api/video/streams/{car_id}/{stream_id}/stop
+POST /api/video/chunks/preprocess
+GET  /api/ai/tasks
+POST /api/ai/tasks
+```
+
+The preprocessing step reads one frame through OpenCV, letterboxes it to the
+configured size, returns a JPEG payload, and reports original/resized metadata.
+The default `yolo_detection` task runs the current configured detector. Extra AI
+features can be registered as task specs with their own model path or future
+Docker command metadata; only in-process YOLO execution is enabled right now.

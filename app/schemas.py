@@ -58,3 +58,78 @@ class SimilarityResult(BaseModel):
     server_latency_ms: float
     yolo_summary: dict = Field(default_factory=dict)
     reference_source: str = "cache"
+
+
+class VideoStreamConfig(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="camera_front", min_length=1)
+    url: str = Field(min_length=1)
+    transport: Literal["rtsp", "http_mjpeg", "http_file", "file", "unknown"] = "unknown"
+    width: int = Field(default=640, ge=64)
+    height: int = Field(default=640, ge=64)
+    fps: float = Field(default=2.0, ge=0.1, le=30.0)
+    sample_interval_ms: int = Field(default=500, ge=33)
+    enabled: bool = True
+    metadata: dict = Field(default_factory=dict)
+
+
+class VideoStreamStatus(BaseModel):
+    ok: bool = True
+    car_id: str
+    stream_id: str
+    url: str
+    transport: str
+    enabled: bool
+    running: bool = False
+    frame_count: int = 0
+    last_error: str = ""
+    last_frame_at: float | None = None
+
+
+class VideoFrameMetadata(BaseModel):
+    width: int
+    height: int
+    channels: int
+    resized_width: int
+    resized_height: int
+    letterboxed: bool
+    source: str
+    timestamp: float
+
+
+class VideoFramePreprocessResult(BaseModel):
+    ok: bool = True
+    car_id: str
+    stream_id: str = "camera_front"
+    frame: ImagePayload
+    metadata: VideoFrameMetadata
+
+
+class VideoChunkUpload(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="camera_front", min_length=1)
+    encoding: Literal["mp4", "avi", "mov", "mjpeg", "unknown"] = "unknown"
+    data: str = Field(min_length=1)
+    frame_index: int = Field(default=0, ge=0)
+
+
+class AiTaskSpec(BaseModel):
+    task_id: str = Field(min_length=1)
+    kind: Literal["yolo", "docker", "custom"] = "yolo"
+    model_path: str = ""
+    backend: str = "auto"
+    docker_image: str = ""
+    docker_command: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    metadata: dict = Field(default_factory=dict)
+
+
+class AiTaskResult(BaseModel):
+    type: Literal["ai_task_result"] = "ai_task_result"
+    ok: bool = True
+    task_id: str
+    car_id: str
+    stream_id: str = "camera_front"
+    latency_ms: float
+    detections: list[Detection] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)

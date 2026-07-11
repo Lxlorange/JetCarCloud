@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     yolo_image_size: int = Field(default=640, ge=64)
     app_result_history: int = Field(default=1, ge=0, le=10)
     edge_frame_url: str = ""
+    video_default_width: int = Field(default=640, ge=64)
+    video_default_height: int = Field(default=640, ge=64)
+    video_default_fps: float = Field(default=2.0, ge=0.1, le=30.0)
+    video_capture_timeout_ms: int = Field(default=5000, ge=100)
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

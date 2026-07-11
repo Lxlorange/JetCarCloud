@@ -1,23 +1,37 @@
 from __future__ import annotations
 
+import asyncio
 import time
 
 import requests
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
+from app.ai_tasks import AiTaskRegistry, run_yolo_task
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
+    AiTaskResult,
+    AiTaskSpec,
     EdgeFrame,
     ImageUpload,
     InferenceResult,
     ReferenceUploadResult,
     SimilarityResult,
+    VideoChunkUpload,
+    VideoFramePreprocessResult,
+    VideoStreamConfig,
+    VideoStreamStatus,
 )
 from app.similarity import compare_images
+from app.video import (
+    VideoStreamRegistry,
+    decode_video_chunk,
+    encode_jpeg_payload,
+    open_stream_frame,
+)
 
 settings = get_settings()
 manager = ConnectionManager(history_size=settings.app_result_history)
@@ -32,6 +46,18 @@ detector = build_detector(
 
 app = FastAPI(title=settings.app_name)
 reference_images = {}
+video_streams = VideoStreamRegistry()
+ai_tasks = AiTaskRegistry()
+stream_workers: dict[tuple[str, str], asyncio.Task] = {}
+ai_tasks.register(
+    AiTaskSpec(
+        task_id="yolo_detection",
+        kind="yolo",
+        model_path=settings.yolo_model_path,
+        backend=settings.yolo_backend,
+        metadata={"detector": detector.__class__.__name__},
+    )
+)
 
 
 @app.get("/health")
@@ -43,6 +69,8 @@ async def health() -> dict:
         "detector_reason": getattr(detector, "reason", ""),
         "connections": await manager.stats(),
         "edge_frame_url": settings.edge_frame_url,
+        "video_streams": len(video_streams.list()),
+        "ai_tasks": [task.task_id for task in ai_tasks.list()],
     }
 
 
@@ -128,6 +156,192 @@ def fetch_edge_frame(url: str):
     if image is None:
         raise ValueError(f"edge frame response is not a decodable image: {url}")
     return image
+
+
+@app.post("/api/video/streams", response_model=VideoStreamStatus)
+async def register_video_stream(payload: VideoStreamConfig) -> VideoStreamStatus:
+    config = payload.model_copy(
+        update={
+            "width": payload.width or settings.video_default_width,
+            "height": payload.height or settings.video_default_height,
+        }
+    )
+    return video_streams.upsert(config)
+
+
+@app.get("/api/video/streams", response_model=list[VideoStreamStatus])
+async def list_video_streams() -> list[VideoStreamStatus]:
+    return video_streams.list()
+
+
+@app.get("/api/video/streams/{car_id}/{stream_id}", response_model=VideoStreamStatus)
+async def get_video_stream(car_id: str, stream_id: str) -> VideoStreamStatus:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+    return video_streams.status(car_id, stream_id)
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/preprocess", response_model=VideoFramePreprocessResult)
+async def preprocess_stream_frame(car_id: str, stream_id: str) -> VideoFramePreprocessResult:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+
+    config = runtime.config
+    try:
+        frame = open_stream_frame(
+            config.url,
+            width=config.width,
+            height=config.height,
+            timeout_ms=settings.video_capture_timeout_ms,
+            source=f"{config.transport}:{config.stream_id}",
+        )
+        video_streams.mark_frame(car_id, stream_id)
+    except Exception as exc:
+        video_streams.mark_error(car_id, stream_id, str(exc))
+        raise HTTPException(status_code=502, detail=f"failed to preprocess stream frame: {exc}") from exc
+
+    return VideoFramePreprocessResult(
+        car_id=car_id,
+        stream_id=stream_id,
+        frame=encode_jpeg_payload(frame.image),
+        metadata=frame.metadata,
+    )
+
+
+@app.post("/api/video/chunks/preprocess", response_model=VideoFramePreprocessResult)
+async def preprocess_video_chunk(payload: VideoChunkUpload) -> VideoFramePreprocessResult:
+    runtime = video_streams.get(payload.car_id, payload.stream_id)
+    width = runtime.config.width if runtime else settings.video_default_width
+    height = runtime.config.height if runtime else settings.video_default_height
+
+    try:
+        frame = decode_video_chunk(
+            payload.data,
+            encoding=payload.encoding,
+            frame_index=payload.frame_index,
+            width=width,
+            height=height,
+            source=f"chunk:{payload.encoding}",
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"failed to preprocess video chunk: {exc}") from exc
+
+    return VideoFramePreprocessResult(
+        car_id=payload.car_id,
+        stream_id=payload.stream_id,
+        frame=encode_jpeg_payload(frame.image),
+        metadata=frame.metadata,
+    )
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/tasks/{task_id}/run-once", response_model=AiTaskResult)
+async def run_stream_task_once(car_id: str, stream_id: str, task_id: str) -> AiTaskResult:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+
+    task = ai_tasks.get(task_id)
+    if task is None or not task.enabled:
+        raise HTTPException(status_code=404, detail="ai task not registered or disabled")
+    if task.kind != "yolo":
+        raise HTTPException(status_code=501, detail="only yolo tasks are executable in-process for now")
+
+    config = runtime.config
+    try:
+        frame = open_stream_frame(
+            config.url,
+            width=config.width,
+            height=config.height,
+            timeout_ms=settings.video_capture_timeout_ms,
+            source=f"{config.transport}:{config.stream_id}",
+        )
+        video_streams.mark_frame(car_id, stream_id)
+    except Exception as exc:
+        video_streams.mark_error(car_id, stream_id, str(exc))
+        raise HTTPException(status_code=502, detail=f"failed to read stream frame: {exc}") from exc
+
+    return run_yolo_task(
+        task_id=task.task_id,
+        detector=detector,
+        image=frame.image,
+        car_id=car_id,
+        stream_id=stream_id,
+        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+    )
+
+
+@app.post("/api/ai/tasks", response_model=AiTaskSpec)
+async def register_ai_task(payload: AiTaskSpec) -> AiTaskSpec:
+    return ai_tasks.register(payload)
+
+
+@app.get("/api/ai/tasks", response_model=list[AiTaskSpec])
+async def list_ai_tasks() -> list[AiTaskSpec]:
+    return ai_tasks.list()
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/start", response_model=VideoStreamStatus)
+async def start_video_stream_worker(car_id: str, stream_id: str) -> VideoStreamStatus:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+
+    key = (car_id, stream_id)
+    worker = stream_workers.get(key)
+    if worker is None or worker.done():
+        video_streams.mark_started(car_id, stream_id)
+        stream_workers[key] = asyncio.create_task(_stream_worker(car_id, stream_id))
+    return video_streams.status(car_id, stream_id)
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/stop", response_model=VideoStreamStatus)
+async def stop_video_stream_worker(car_id: str, stream_id: str) -> VideoStreamStatus:
+    key = (car_id, stream_id)
+    worker = stream_workers.pop(key, None)
+    if worker is not None:
+        worker.cancel()
+    if video_streams.get(car_id, stream_id) is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+    video_streams.mark_stopped(car_id, stream_id)
+    return video_streams.status(car_id, stream_id)
+
+
+async def _stream_worker(car_id: str, stream_id: str) -> None:
+    try:
+        while True:
+            runtime = video_streams.get(car_id, stream_id)
+            if runtime is None or not runtime.config.enabled:
+                return
+            config = runtime.config
+            try:
+                frame = await asyncio.to_thread(
+                    open_stream_frame,
+                    config.url,
+                    width=config.width,
+                    height=config.height,
+                    timeout_ms=settings.video_capture_timeout_ms,
+                    source=f"{config.transport}:{config.stream_id}",
+                )
+                video_streams.mark_frame(car_id, stream_id)
+                result = run_yolo_task(
+                    task_id="yolo_detection",
+                    detector=detector,
+                    image=frame.image,
+                    car_id=car_id,
+                    stream_id=stream_id,
+                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+                )
+                await manager.publish(car_id, result.model_dump(mode="json"))
+            except Exception as exc:
+                video_streams.mark_error(car_id, stream_id, str(exc))
+            await asyncio.sleep(max(0.033, config.sample_interval_ms / 1000.0))
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if video_streams.get(car_id, stream_id) is not None:
+            video_streams.mark_stopped(car_id, stream_id)
 
 
 @app.websocket("/ws/inference/{car_id}/edge")
