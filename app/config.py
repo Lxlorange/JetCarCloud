@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     roboflow_model_id: str = "manhole-wsmwd"
     roboflow_model_version: str = "1"
     roboflow_api_url: str = ""
+    road_defect_model_path: str = ""
+    road_defect_backend: str = "ultralytics"
+    road_defect_device: str = "cpu"
+    road_defect_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
+    road_defect_image_size: int = Field(default=640, ge=64)
+    road_defect_positive_labels: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

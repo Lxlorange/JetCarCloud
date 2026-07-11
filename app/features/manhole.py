@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import requests
 
+from app.features.annotate import draw_detections
 from app.inference.detector import Detector, NullDetector, build_detector
 from app.schemas import Detection, ManholeDetectionResult
 from app.video import encode_jpeg_payload
@@ -40,6 +41,7 @@ class ManholeProvider(ABC):
         car_id: str,
         stream_id: str,
         metadata: dict | None = None,
+        include_image: bool = False,
     ) -> ManholeDetectionResult:
         raise NotImplementedError
 
@@ -58,11 +60,15 @@ class LocalYoloManholeProvider(ManholeProvider):
         car_id: str,
         stream_id: str,
         metadata: dict | None = None,
+        include_image: bool = False,
     ) -> ManholeDetectionResult:
         started = time.perf_counter()
         detections = self._detector.detect(image, {})
         filtered = _filter_manhole_detections(detections, self._positive_labels)
         latency_ms = (time.perf_counter() - started) * 1000.0
+        annotated = None
+        if include_image:
+            annotated = encode_jpeg_payload(draw_detections(image, filtered, color=(0, 180, 255), prefix="manhole:"))
         return ManholeDetectionResult(
             car_id=car_id,
             stream_id=stream_id,
@@ -73,6 +79,7 @@ class LocalYoloManholeProvider(ManholeProvider):
             detections=filtered,
             metadata=metadata or {},
             error=getattr(self._detector, "reason", ""),
+            annotated_image=annotated,
         )
 
 
@@ -101,6 +108,7 @@ class RoboflowManholeProvider(ManholeProvider):
         car_id: str,
         stream_id: str,
         metadata: dict | None = None,
+        include_image: bool = False,
     ) -> ManholeDetectionResult:
         started = time.perf_counter()
         payload = encode_jpeg_payload(image)
@@ -119,6 +127,9 @@ class RoboflowManholeProvider(ManholeProvider):
             if float(prediction.get("confidence", 0.0)) >= self._confidence
         ]
         latency_ms = (time.perf_counter() - started) * 1000.0
+        annotated = None
+        if include_image:
+            annotated = encode_jpeg_payload(draw_detections(image, detections, color=(0, 180, 255), prefix="manhole:"))
         return ManholeDetectionResult(
             car_id=car_id,
             stream_id=stream_id,
@@ -135,6 +146,7 @@ class RoboflowManholeProvider(ManholeProvider):
                     "image": data.get("image", {}),
                 },
             },
+            annotated_image=annotated,
         )
 
     def _prediction_url(self) -> str:
@@ -156,6 +168,7 @@ class UnavailableManholeProvider(ManholeProvider):
         car_id: str,
         stream_id: str,
         metadata: dict | None = None,
+        include_image: bool = False,
     ) -> ManholeDetectionResult:
         return ManholeDetectionResult(
             ok=False,

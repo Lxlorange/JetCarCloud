@@ -8,6 +8,8 @@ from app.schemas import (
     EdgeFrame,
     InferenceResult,
     ManholeDetectionResult,
+    RoadDefectDetectionResult,
+    RoadInspectionResult,
     VideoStreamConfig,
 )
 from app.video import encode_jpeg_payload, preprocess_frame
@@ -85,3 +87,29 @@ def test_manhole_detection_result_schema() -> None:
     assert data["type"] == "manhole_detection"
     assert data["found"] is True
     assert data["count"] == 1
+
+
+def test_road_defect_detection_result_schema() -> None:
+    result = RoadDefectDetectionResult(
+        car_id="car_001",
+        stream_id="camera_front",
+        provider="local",
+        found=True,
+        count=1,
+        detections=[Detection(label="crack", confidence=0.8, bbox=[1, 2, 3, 4])],
+    )
+    data = result.model_dump()
+    assert data["type"] == "road_defect_detection"
+    assert data["found"] is True
+
+
+def test_road_inspection_result_schema() -> None:
+    manhole = ManholeDetectionResult(car_id="car_001", provider="local")
+    road_defect = RoadDefectDetectionResult(car_id="car_001", provider="local")
+    result = RoadInspectionResult(
+        car_id="car_001",
+        stream_id="camera_front",
+        manhole=manhole,
+        road_defect=road_defect,
+    )
+    assert result.model_dump()["type"] == "road_inspection"

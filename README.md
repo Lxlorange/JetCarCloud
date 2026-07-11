@@ -266,3 +266,55 @@ python scripts/detect_manhole.py \
   --stream-id camera_front \
   --stream
 ```
+
+## Road Defect and Combined Road Inspection
+
+Road defect detection is a separate feature that uses a YOLOv8/Ultralytics
+model. Point `ROAD_DEFECT_MODEL_PATH` to your `YOLOv8_Small_2nd_Model.pt` file:
+
+```bash
+ROAD_DEFECT_MODEL_PATH=/home/orangelxl/jetson/models/YOLOv8_Small_2nd_Model.pt
+ROAD_DEFECT_BACKEND=ultralytics
+ROAD_DEFECT_DEVICE=cpu
+ROAD_DEFECT_CONFIDENCE=0.25
+ROAD_DEFECT_POSITIVE_LABELS=
+```
+
+APIs:
+
+```text
+POST /api/features/road-defect/detect
+POST /api/video/streams/{car_id}/{stream_id}/features/road-defect/run-once
+POST /api/features/road-inspection/detect
+POST /api/video/streams/{car_id}/{stream_id}/features/road-inspection/run-once
+```
+
+`road-inspection` runs both manhole detection and road-defect detection on the
+same frame. Add `include_image=true` to return an annotated JPEG payload for the
+mobile app. For upload APIs, put `"include_image": true` in the JSON body. For
+stream APIs, use the query string.
+
+Unified test script:
+
+```bash
+python scripts/detect_road_feature.py \
+  --cloud http://127.0.0.1:8000 \
+  --feature road-inspection \
+  --image /path/to/road-test.jpg \
+  --include-image
+```
+
+Stream example:
+
+```bash
+python scripts/detect_road_feature.py \
+  --cloud http://127.0.0.1:8000 \
+  --feature road-inspection \
+  --car-id car_001 \
+  --stream-id camera_front \
+  --stream \
+  --include-image
+```
+
+The returned `annotated_image` field is the processed frame encoded as a base64
+JPEG using the same `ImagePayload` shape as other image APIs.

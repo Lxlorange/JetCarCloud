@@ -11,16 +11,21 @@ from app.ai_tasks import AiTaskRegistry, run_yolo_task
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
 from app.features.manhole import ManholeSettings, build_manhole_provider
+from app.features.road_defect import RoadDefectSettings, build_road_defect_provider
+from app.features.road_inspection import inspect_road
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
     AiTaskResult,
     AiTaskSpec,
     EdgeFrame,
+    FeatureImageUpload,
     ImageUpload,
     InferenceResult,
     ManholeDetectionResult,
     ReferenceUploadResult,
+    RoadDefectDetectionResult,
+    RoadInspectionResult,
     SimilarityResult,
     VideoChunkUpload,
     VideoFramePreprocessResult,
@@ -65,6 +70,20 @@ manhole_provider = build_manhole_provider(
         roboflow_api_url=settings.roboflow_api_url,
     )
 )
+road_defect_provider = build_road_defect_provider(
+    RoadDefectSettings(
+        model_path=settings.road_defect_model_path,
+        backend=settings.road_defect_backend,
+        device=settings.road_defect_device,
+        confidence=settings.road_defect_confidence,
+        image_size=settings.road_defect_image_size,
+        positive_labels={
+            label.strip().lower()
+            for label in settings.road_defect_positive_labels.split(",")
+            if label.strip()
+        },
+    )
+)
 
 app = FastAPI(title=settings.app_name)
 reference_images = {}
@@ -78,6 +97,22 @@ ai_tasks.register(
         model_path=settings.yolo_model_path,
         backend=settings.yolo_backend,
         metadata={"detector": detector.__class__.__name__},
+    )
+)
+ai_tasks.register(
+    AiTaskSpec(
+        task_id="road_defect_detection",
+        kind="custom",
+        model_path=settings.road_defect_model_path,
+        backend=settings.road_defect_backend,
+        metadata={"provider": road_defect_provider.name},
+    )
+)
+ai_tasks.register(
+    AiTaskSpec(
+        task_id="road_inspection",
+        kind="custom",
+        metadata={"features": ["manhole_detection", "road_defect_detection"]},
     )
 )
 ai_tasks.register(
@@ -103,6 +138,7 @@ async def health() -> dict:
         "video_streams": len(video_streams.list()),
         "ai_tasks": [task.task_id for task in ai_tasks.list()],
         "manhole_provider": manhole_provider.name,
+        "road_defect_provider": road_defect_provider.name,
     }
 
 
@@ -188,6 +224,27 @@ def fetch_edge_frame(url: str):
     if image is None:
         raise ValueError(f"edge frame response is not a decodable image: {url}")
     return image
+
+
+def _read_registered_stream_frame(car_id: str, stream_id: str):
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+
+    config = runtime.config
+    try:
+        frame = open_stream_frame(
+            config.url,
+            width=config.width,
+            height=config.height,
+            timeout_ms=settings.video_capture_timeout_ms,
+            source=f"{config.transport}:{config.stream_id}",
+        )
+        video_streams.mark_frame(car_id, stream_id)
+        return frame
+    except Exception as exc:
+        video_streams.mark_error(car_id, stream_id, str(exc))
+        raise HTTPException(status_code=502, detail=f"failed to read stream frame: {exc}") from exc
 
 
 @app.post("/api/video/streams", response_model=VideoStreamStatus)
@@ -315,7 +372,7 @@ async def list_ai_tasks() -> list[AiTaskSpec]:
 
 
 @app.post("/api/features/manhole/detect", response_model=ManholeDetectionResult)
-async def detect_manhole_image(payload: ImageUpload) -> ManholeDetectionResult:
+async def detect_manhole_image(payload: FeatureImageUpload) -> ManholeDetectionResult:
     try:
         image = decode_jpeg(payload.image)
     except Exception as exc:
@@ -333,34 +390,100 @@ async def detect_manhole_image(payload: ImageUpload) -> ManholeDetectionResult:
                 "encoding": payload.image.encoding,
             },
         },
+        include_image=payload.include_image,
     )
 
 
 @app.post("/api/video/streams/{car_id}/{stream_id}/features/manhole/run-once", response_model=ManholeDetectionResult)
-async def detect_manhole_stream_once(car_id: str, stream_id: str) -> ManholeDetectionResult:
-    runtime = video_streams.get(car_id, stream_id)
-    if runtime is None:
-        raise HTTPException(status_code=404, detail="video stream not registered")
-
-    config = runtime.config
-    try:
-        frame = open_stream_frame(
-            config.url,
-            width=config.width,
-            height=config.height,
-            timeout_ms=settings.video_capture_timeout_ms,
-            source=f"{config.transport}:{config.stream_id}",
-        )
-        video_streams.mark_frame(car_id, stream_id)
-    except Exception as exc:
-        video_streams.mark_error(car_id, stream_id, str(exc))
-        raise HTTPException(status_code=502, detail=f"failed to read stream frame: {exc}") from exc
+async def detect_manhole_stream_once(car_id: str, stream_id: str, include_image: bool = False) -> ManholeDetectionResult:
+    frame = _read_registered_stream_frame(car_id, stream_id)
 
     return manhole_provider.detect(
         frame.image,
         car_id=car_id,
         stream_id=stream_id,
         metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+        include_image=include_image,
+    )
+
+
+@app.post("/api/features/road-defect/detect", response_model=RoadDefectDetectionResult)
+async def detect_road_defect_image(payload: FeatureImageUpload) -> RoadDefectDetectionResult:
+    try:
+        image = decode_jpeg(payload.image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
+
+    return road_defect_provider.detect(
+        image,
+        car_id=payload.car_id,
+        stream_id="upload",
+        metadata={
+            "source": "upload",
+            "image": {
+                "width": payload.image.width,
+                "height": payload.image.height,
+                "encoding": payload.image.encoding,
+            },
+        },
+        include_image=payload.include_image,
+    )
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/features/road-defect/run-once", response_model=RoadDefectDetectionResult)
+async def detect_road_defect_stream_once(
+    car_id: str,
+    stream_id: str,
+    include_image: bool = False,
+) -> RoadDefectDetectionResult:
+    frame = _read_registered_stream_frame(car_id, stream_id)
+
+    return road_defect_provider.detect(
+        frame.image,
+        car_id=car_id,
+        stream_id=stream_id,
+        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+        include_image=include_image,
+    )
+
+
+@app.post("/api/features/road-inspection/detect", response_model=RoadInspectionResult)
+async def inspect_road_image(payload: FeatureImageUpload) -> RoadInspectionResult:
+    try:
+        image = decode_jpeg(payload.image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
+
+    return inspect_road(
+        image,
+        car_id=payload.car_id,
+        stream_id="upload",
+        manhole_provider=manhole_provider,
+        road_defect_provider=road_defect_provider,
+        metadata={
+            "source": "upload",
+            "image": {
+                "width": payload.image.width,
+                "height": payload.image.height,
+                "encoding": payload.image.encoding,
+            },
+        },
+        include_image=payload.include_image,
+    )
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/features/road-inspection/run-once", response_model=RoadInspectionResult)
+async def inspect_road_stream_once(car_id: str, stream_id: str, include_image: bool = False) -> RoadInspectionResult:
+    frame = _read_registered_stream_frame(car_id, stream_id)
+
+    return inspect_road(
+        frame.image,
+        car_id=car_id,
+        stream_id=stream_id,
+        manhole_provider=manhole_provider,
+        road_defect_provider=road_defect_provider,
+        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+        include_image=include_image,
     )
 
 
@@ -423,6 +546,16 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
                     metadata={"preprocess": frame.metadata.model_dump(mode="json")},
                 )
                 await manager.publish(car_id, manhole_result.model_dump(mode="json"))
+                inspection_result = inspect_road(
+                    frame.image,
+                    car_id=car_id,
+                    stream_id=stream_id,
+                    manhole_provider=manhole_provider,
+                    road_defect_provider=road_defect_provider,
+                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+                    include_image=False,
+                )
+                await manager.publish(car_id, inspection_result.model_dump(mode="json"))
             except Exception as exc:
                 video_streams.mark_error(car_id, stream_id, str(exc))
             await asyncio.sleep(max(0.033, config.sample_interval_ms / 1000.0))
