@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.schemas import AiTaskResult, Detection, EdgeFrame, InferenceResult, VideoStreamConfig
+from app.schemas import (
+    AiTaskResult,
+    Detection,
+    EdgeFrame,
+    InferenceResult,
+    ManholeDetectionResult,
+    VideoStreamConfig,
+)
 from app.video import encode_jpeg_payload, preprocess_frame
 
 
@@ -63,3 +70,18 @@ def test_video_frame_preprocess_letterboxes_to_target_size() -> None:
 def test_ai_task_result_has_message_type() -> None:
     result = AiTaskResult(task_id="yolo_detection", car_id="car_001", latency_ms=1.0)
     assert result.model_dump()["type"] == "ai_task_result"
+
+
+def test_manhole_detection_result_schema() -> None:
+    result = ManholeDetectionResult(
+        car_id="car_001",
+        stream_id="camera_front",
+        provider="local",
+        found=True,
+        count=1,
+        detections=[Detection(label="manhole", confidence=0.8, bbox=[1, 2, 3, 4])],
+    )
+    data = result.model_dump()
+    assert data["type"] == "manhole_detection"
+    assert data["found"] is True
+    assert data["count"] == 1

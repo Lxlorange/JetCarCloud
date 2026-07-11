@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from app.ai_tasks import AiTaskRegistry, run_yolo_task
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
+from app.features.manhole import ManholeSettings, build_manhole_provider
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
@@ -18,6 +19,7 @@ from app.schemas import (
     EdgeFrame,
     ImageUpload,
     InferenceResult,
+    ManholeDetectionResult,
     ReferenceUploadResult,
     SimilarityResult,
     VideoChunkUpload,
@@ -43,6 +45,26 @@ detector = build_detector(
     confidence=settings.yolo_confidence,
     image_size=settings.yolo_image_size,
 )
+manhole_provider = build_manhole_provider(
+    ManholeSettings(
+        provider=settings.manhole_provider,
+        model_path=settings.manhole_model_path,
+        backend=settings.manhole_backend,
+        yolov5_repo_path=settings.manhole_yolov5_repo_path,
+        device=settings.manhole_device,
+        confidence=settings.manhole_confidence,
+        image_size=settings.manhole_image_size,
+        positive_labels={
+            label.strip().lower()
+            for label in settings.manhole_positive_labels.split(",")
+            if label.strip()
+        },
+        roboflow_api_key=settings.roboflow_api_key,
+        roboflow_model_id=settings.roboflow_model_id,
+        roboflow_model_version=settings.roboflow_model_version,
+        roboflow_api_url=settings.roboflow_api_url,
+    )
+)
 
 app = FastAPI(title=settings.app_name)
 reference_images = {}
@@ -58,6 +80,15 @@ ai_tasks.register(
         metadata={"detector": detector.__class__.__name__},
     )
 )
+ai_tasks.register(
+    AiTaskSpec(
+        task_id="manhole_detection",
+        kind="custom",
+        model_path=settings.manhole_model_path,
+        backend=settings.manhole_backend,
+        metadata={"provider": manhole_provider.name},
+    )
+)
 
 
 @app.get("/health")
@@ -71,6 +102,7 @@ async def health() -> dict:
         "edge_frame_url": settings.edge_frame_url,
         "video_streams": len(video_streams.list()),
         "ai_tasks": [task.task_id for task in ai_tasks.list()],
+        "manhole_provider": manhole_provider.name,
     }
 
 
@@ -282,6 +314,56 @@ async def list_ai_tasks() -> list[AiTaskSpec]:
     return ai_tasks.list()
 
 
+@app.post("/api/features/manhole/detect", response_model=ManholeDetectionResult)
+async def detect_manhole_image(payload: ImageUpload) -> ManholeDetectionResult:
+    try:
+        image = decode_jpeg(payload.image)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
+
+    return manhole_provider.detect(
+        image,
+        car_id=payload.car_id,
+        stream_id="upload",
+        metadata={
+            "source": "upload",
+            "image": {
+                "width": payload.image.width,
+                "height": payload.image.height,
+                "encoding": payload.image.encoding,
+            },
+        },
+    )
+
+
+@app.post("/api/video/streams/{car_id}/{stream_id}/features/manhole/run-once", response_model=ManholeDetectionResult)
+async def detect_manhole_stream_once(car_id: str, stream_id: str) -> ManholeDetectionResult:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+
+    config = runtime.config
+    try:
+        frame = open_stream_frame(
+            config.url,
+            width=config.width,
+            height=config.height,
+            timeout_ms=settings.video_capture_timeout_ms,
+            source=f"{config.transport}:{config.stream_id}",
+        )
+        video_streams.mark_frame(car_id, stream_id)
+    except Exception as exc:
+        video_streams.mark_error(car_id, stream_id, str(exc))
+        raise HTTPException(status_code=502, detail=f"failed to read stream frame: {exc}") from exc
+
+    return manhole_provider.detect(
+        frame.image,
+        car_id=car_id,
+        stream_id=stream_id,
+        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+    )
+
+
 @app.post("/api/video/streams/{car_id}/{stream_id}/start", response_model=VideoStreamStatus)
 async def start_video_stream_worker(car_id: str, stream_id: str) -> VideoStreamStatus:
     runtime = video_streams.get(car_id, stream_id)
@@ -334,6 +416,13 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
                     metadata={"preprocess": frame.metadata.model_dump(mode="json")},
                 )
                 await manager.publish(car_id, result.model_dump(mode="json"))
+                manhole_result = manhole_provider.detect(
+                    frame.image,
+                    car_id=car_id,
+                    stream_id=stream_id,
+                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
+                )
+                await manager.publish(car_id, manhole_result.model_dump(mode="json"))
             except Exception as exc:
                 video_streams.mark_error(car_id, stream_id, str(exc))
             await asyncio.sleep(max(0.033, config.sample_interval_ms / 1000.0))

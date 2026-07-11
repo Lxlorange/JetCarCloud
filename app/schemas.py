@@ -133,3 +133,17 @@ class AiTaskResult(BaseModel):
     latency_ms: float
     detections: list[Detection] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+
+
+class ManholeDetectionResult(BaseModel):
+    type: Literal["manhole_detection"] = "manhole_detection"
+    ok: bool = True
+    car_id: str = "car_001"
+    stream_id: str = "camera_front"
+    provider: Literal["local", "roboflow", "none"] = "none"
+    found: bool = False
+    count: int = 0
+    latency_ms: float = 0.0
+    detections: list[Detection] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+    error: str = ""

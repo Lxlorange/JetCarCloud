@@ -211,3 +211,58 @@ configured size, returns a JPEG payload, and reports original/resized metadata.
 The default `yolo_detection` task runs the current configured detector. Extra AI
 features can be registered as task specs with their own model path or future
 Docker command metadata; only in-process YOLO execution is enabled right now.
+
+## Manhole Detection Feature
+
+The manhole feature is implemented as a separate feature module on top of the
+shared video layer. The default provider is the local YOLOv5 `.pt` model because
+it works offline, has lower latency, and does not send camera frames to an
+external service. Roboflow can still be enabled as a fallback or comparison
+provider.
+
+Local YOLOv5 configuration:
+
+```bash
+MANHOLE_PROVIDER=local
+MANHOLE_MODEL_PATH=/home/orangelxl/jetson/models/manhole.pt
+MANHOLE_BACKEND=yolov5
+MANHOLE_YOLOV5_REPO_PATH=/home/orangelxl/jetson/yolov5-7.0
+MANHOLE_DEVICE=cpu
+MANHOLE_CONFIDENCE=0.25
+MANHOLE_POSITIVE_LABELS=manhole,manhole-cover,cover
+```
+
+Roboflow configuration:
+
+```bash
+MANHOLE_PROVIDER=roboflow
+ROBOFLOW_API_KEY=your-api-key
+ROBOFLOW_MODEL_ID=manhole-wsmwd
+ROBOFLOW_MODEL_VERSION=1
+```
+
+HTTP APIs:
+
+```text
+POST /api/features/manhole/detect
+POST /api/video/streams/{car_id}/{stream_id}/features/manhole/run-once
+```
+
+Test an image:
+
+```bash
+python scripts/detect_manhole.py \
+  --cloud http://127.0.0.1:8000 \
+  --car-id car_001 \
+  --image /path/to/manhole-test.jpg
+```
+
+Test one frame from a registered stream:
+
+```bash
+python scripts/detect_manhole.py \
+  --cloud http://127.0.0.1:8000 \
+  --car-id car_001 \
+  --stream-id camera_front \
+  --stream
+```
