@@ -9,6 +9,30 @@
       "timeout_seconds": 60,
       "enabled": true,
       "metadata": {}
+    },
+    "yolov5-manhole-detect": {
+      "name": "YOLOv5 Manhole Detection",
+      "runner": "docker",
+      "image": "model-yolov5-manhole-detect:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {
+        "task": "manhole_detection"
+      }
+    },
+    "yolov8-road-damage": {
+      "name": "YOLOv8 Road Damage Detection",
+      "runner": "docker",
+      "image": "model-yolov8-road-damage:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {
+        "task": "road_damage_detection"
+      }
     }
   }
 }

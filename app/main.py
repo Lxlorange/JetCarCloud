@@ -282,6 +282,7 @@ async def push_video_frame(
     stream_id: str,
     payload: ImageUpload,
     algorithm_id: str | None = None,
+    algorithm_ids: str | None = None,
     include_image: bool = True,
 ) -> VideoFrameUploadResult:
     return await _accept_pushed_frame(
@@ -289,6 +290,7 @@ async def push_video_frame(
         car_id=car_id,
         stream_id=stream_id,
         algorithm_id=algorithm_id,
+        algorithm_ids=algorithm_ids,
         include_image=include_image,
     )
 
@@ -485,17 +487,24 @@ async def _processed_mjpeg_generator(
         await asyncio.sleep(max(0.0, interval - elapsed))
 
 
-def _algorithm_ids_for_push(runtime, algorithm_id: str | None) -> list[str]:
-    if algorithm_id:
-        return [algorithm_id]
+def _algorithm_ids_for_push(runtime, algorithm_id: str | None, algorithm_ids: str | None) -> list[str]:
+    requested = _parse_algorithm_ids(algorithm_ids) + _parse_algorithm_ids(algorithm_id)
+    if requested:
+        return requested
     if runtime is None:
         return []
     configured = runtime.config.metadata.get("algorithms", [])
     if isinstance(configured, str):
-        return [configured]
+        return _parse_algorithm_ids(configured)
     if isinstance(configured, list):
         return [str(item) for item in configured if str(item)]
     return []
+
+
+def _parse_algorithm_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
 
 
 async def _accept_pushed_frame(
@@ -504,6 +513,7 @@ async def _accept_pushed_frame(
     car_id: str,
     stream_id: str,
     algorithm_id: str | None,
+    algorithm_ids: str | None,
     include_image: bool,
 ) -> VideoFrameUploadResult:
     image = decode_jpeg(payload.image)
@@ -534,7 +544,12 @@ async def _accept_pushed_frame(
     )
     video_streams.store_frame(car_id, stream_id, frame)
     status = video_streams.status(car_id, stream_id)
-    algorithm_ids = _algorithm_ids_for_push(video_streams.get(car_id, stream_id), algorithm_id)
+    queued_algorithm_ids = _algorithm_ids_for_push(video_streams.get(car_id, stream_id), algorithm_id, algorithm_ids)
+    for item in queued_algorithm_ids:
+        try:
+            algorithm_service.catalog.require(item)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
     await manager.publish(
         car_id,
         {
@@ -548,7 +563,7 @@ async def _accept_pushed_frame(
         frame=frame,
         car_id=car_id,
         stream_id=stream_id,
-        algorithm_ids=algorithm_ids,
+        algorithm_ids=queued_algorithm_ids,
         include_image=include_image,
     )
     return VideoFrameUploadResult(
@@ -556,7 +571,7 @@ async def _accept_pushed_frame(
         stream_id=stream_id,
         frame_count=status.frame_count,
         metadata=frame.metadata,
-        algorithms_queued=algorithm_ids,
+        algorithms_queued=queued_algorithm_ids,
     )
 
 
@@ -673,6 +688,7 @@ async def edge_socket(websocket: WebSocket, car_id: str) -> None:
 async def edge_video_socket(websocket: WebSocket, car_id: str, stream_id: str) -> None:
     await websocket.accept()
     algorithm_id = websocket.query_params.get("algorithm_id")
+    algorithm_ids = websocket.query_params.get("algorithm_ids") or websocket.query_params.get("algorithms")
     include_image = websocket.query_params.get("include_image", "true").lower() != "false"
     while True:
         try:
@@ -683,6 +699,7 @@ async def edge_video_socket(websocket: WebSocket, car_id: str, stream_id: str) -
                 car_id=car_id,
                 stream_id=stream_id,
                 algorithm_id=algorithm_id,
+                algorithm_ids=algorithm_ids,
                 include_image=include_image,
             )
             await websocket.send_json(result.model_dump(mode="json"))

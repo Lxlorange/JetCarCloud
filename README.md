@@ -130,6 +130,17 @@ Reload the catalog:
 curl -X POST http://127.0.0.1:8000/api/algorithms/reload
 ```
 
+The current runtime catalog registers these Docker images:
+
+```text
+yolov5-similarity       -> model-yolov5-similarity:v1
+yolov5-manhole-detect  -> model-yolov5-manhole-detect:v1
+yolov8-road-damage     -> model-yolov8-road-damage:v1
+```
+
+Adding another model should only require adding one entry to `algorithms.json`
+as long as the container follows the contract below.
+
 ## Container Contract
 
 Cloud runs containers like this:
@@ -218,6 +229,24 @@ Cloud auto-creates or updates the stream when the first frame arrives:
 POST /api/video/streams/{car_id}/{stream_id}/frames
 ```
 
+To trigger one algorithm while pushing a frame:
+
+```text
+POST /api/video/streams/{car_id}/{stream_id}/frames?algorithm_id=yolov5-manhole-detect
+```
+
+To trigger multiple algorithms on the same frame:
+
+```text
+POST /api/video/streams/{car_id}/{stream_id}/frames?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage
+```
+
+For WebSocket push, use the same query parameters:
+
+```text
+ws://<cloud-ip>:8000/ws/video/car_001/camera_front/edge?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage
+```
+
 Payload:
 
 ```json
@@ -300,6 +329,14 @@ Open the same URL in a browser, VLC, or the mobile app image view. Each frame is
 read from the latest pushed edge frame or captured from the registered camera
 URL, written to `/app/data/input/frame.jpg`, processed by the configured Docker
 image, and streamed back from `/app/data/output/annotated.jpg`.
+
+Each MJPEG URL shows one algorithm's processed frames. If the edge side triggers
+both manhole and road-damage algorithms, open one URL per algorithm:
+
+```text
+http://<cloud-ip>:8000/api/video/streams/car_001/camera_front/algorithms/yolov5-manhole-detect/mjpeg?fps=5
+http://<cloud-ip>:8000/api/video/streams/car_001/camera_front/algorithms/yolov8-road-damage/mjpeg?fps=5
+```
 
 This is functional for preview and integration testing, but it starts a Docker
 container per frame. For higher real-time FPS, package the model as a persistent
