@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     algorithm_catalog_path: str = "algorithms.json"
     algorithm_work_dir: str = ".jetcar_algorithm_runs"
     docker_executable: str = "docker"
+    debug_dump_enabled: bool = True
+    debug_dump_dir: str = ".jetcar_debug"
+    debug_save_images: bool = True
+    debug_save_algorithm_outputs: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

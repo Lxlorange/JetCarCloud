@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
+import logging
+import shutil
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import requests
@@ -41,6 +45,8 @@ from app.video import (
 )
 
 settings = get_settings()
+logger = logging.getLogger("jetcar.cloud")
+logger.setLevel(logging.INFO)
 manager = ConnectionManager(history_size=settings.app_result_history)
 detector = build_detector(
     settings.yolo_model_path,
@@ -71,6 +77,7 @@ class ProcessedFrameCacheItem:
 
 processed_frames: dict[tuple[str, str, str], ProcessedFrameCacheItem] = {}
 processing_tasks: set[asyncio.Task] = set()
+debug_dump_dir = Path(settings.debug_dump_dir)
 
 
 @app.get("/health")
@@ -311,7 +318,7 @@ async def run_algorithm(algorithm_id: str, payload: AlgorithmRunRequest) -> Algo
         raise HTTPException(status_code=400, detail="image is required")
     try:
         image = decode_jpeg(payload.image)
-        return algorithm_service.run_image(
+        result = algorithm_service.run_image(
             algorithm_id=algorithm_id,
             image=image,
             car_id=payload.car_id,
@@ -319,6 +326,25 @@ async def run_algorithm(algorithm_id: str, payload: AlgorithmRunRequest) -> Algo
             parameters=payload.parameters,
             include_image=payload.include_image,
         )
+        debug_dir = _debug_dump_algorithm_result(
+            car_id=payload.car_id,
+            stream_id=payload.stream_id,
+            algorithm_id=algorithm_id,
+            result=result,
+        )
+        logger.info(
+            "algorithm upload result car_id=%s stream_id=%s algorithm_id=%s ok=%s latency_ms=%.3f detections=%s annotated=%s debug_dir=%s error=%s",
+            payload.car_id,
+            payload.stream_id,
+            algorithm_id,
+            result.ok,
+            result.latency_ms,
+            _summarize_detection_count(result.result),
+            result.annotated_image is not None,
+            debug_dir or "",
+            result.error,
+        )
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -334,7 +360,7 @@ async def run_stream_algorithm_once(
 ) -> AlgorithmRunResult:
     frame = _read_registered_stream_frame(car_id, stream_id)
     try:
-        return algorithm_service.run_image(
+        result = algorithm_service.run_image(
             algorithm_id=algorithm_id,
             image=frame.image,
             car_id=car_id,
@@ -342,6 +368,26 @@ async def run_stream_algorithm_once(
             parameters={"preprocess": frame.metadata.model_dump(mode="json")},
             include_image=include_image,
         )
+        _cache_processed_frame(car_id, stream_id, algorithm_id, result)
+        debug_dir = _debug_dump_algorithm_result(
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            result=result,
+        )
+        logger.info(
+            "algorithm run-once result car_id=%s stream_id=%s algorithm_id=%s ok=%s latency_ms=%.3f detections=%s annotated=%s debug_dir=%s error=%s",
+            car_id,
+            stream_id,
+            algorithm_id,
+            result.ok,
+            result.latency_ms,
+            _summarize_detection_count(result.result),
+            result.annotated_image is not None,
+            debug_dir or "",
+            result.error,
+        )
+        return result
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
@@ -550,6 +596,27 @@ async def _accept_pushed_frame(
             algorithm_service.catalog.require(item)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+    debug_frame_dir = _debug_dump_received_frame(
+        car_id=car_id,
+        stream_id=stream_id,
+        frame_count=status.frame_count,
+        image=image,
+        frame=frame,
+        payload=payload,
+        algorithm_ids=queued_algorithm_ids,
+    )
+    logger.info(
+        "received frame car_id=%s stream_id=%s frame_count=%s image=%sx%s processed=%sx%s algorithms=%s debug_dir=%s",
+        car_id,
+        stream_id,
+        status.frame_count,
+        payload.image.width,
+        payload.image.height,
+        frame.metadata.resized_width,
+        frame.metadata.resized_height,
+        queued_algorithm_ids,
+        debug_frame_dir or "",
+    )
     await manager.publish(
         car_id,
         {
@@ -616,9 +683,40 @@ async def _run_algorithm_for_pushed_frame(
             include_image=include_image,
         )
         _cache_processed_frame(car_id, stream_id, algorithm_id, result)
+        debug_dir = _debug_dump_algorithm_result(
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            result=result,
+        )
+        logger.info(
+            "algorithm result car_id=%s stream_id=%s algorithm_id=%s ok=%s latency_ms=%.3f detections=%s annotated=%s debug_dir=%s error=%s",
+            car_id,
+            stream_id,
+            algorithm_id,
+            result.ok,
+            result.latency_ms,
+            _summarize_detection_count(result.result),
+            result.annotated_image is not None,
+            debug_dir or "",
+            result.error,
+        )
         await manager.publish(car_id, result.model_dump(mode="json"))
     except Exception as exc:
         video_streams.mark_error(car_id, stream_id, str(exc))
+        debug_dir = _debug_dump_algorithm_error(
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            error=exc,
+        )
+        logger.exception(
+            "algorithm failed car_id=%s stream_id=%s algorithm_id=%s debug_dir=%s",
+            car_id,
+            stream_id,
+            algorithm_id,
+            debug_dir or "",
+        )
         await manager.publish(
             car_id,
             {
@@ -646,6 +744,161 @@ def _cache_processed_frame(car_id: str, stream_id: str, algorithm_id: str, resul
         result=result,
         timestamp=time.time(),
     )
+
+
+def _debug_dump_received_frame(
+    *,
+    car_id: str,
+    stream_id: str,
+    frame_count: int,
+    image,
+    frame,
+    payload: ImageUpload,
+    algorithm_ids: list[str],
+) -> str:
+    if not settings.debug_dump_enabled:
+        return ""
+    frame_dir = _debug_frame_dir(car_id, stream_id, frame_count)
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "event": "frame_received",
+        "car_id": car_id,
+        "stream_id": stream_id,
+        "frame_count": frame_count,
+        "received_image": {
+            "encoding": payload.image.encoding,
+            "width": payload.image.width,
+            "height": payload.image.height,
+            "base64_length": len(payload.image.data),
+        },
+        "processed_metadata": frame.metadata.model_dump(mode="json"),
+        "algorithms_queued": algorithm_ids,
+        "saved_at": time.time(),
+    }
+    _write_json(frame_dir / "frame_metadata.json", metadata)
+    if settings.debug_save_images:
+        _write_debug_image(frame_dir / "received.jpg", image)
+        _write_debug_image(frame_dir / "preprocessed.jpg", frame.image)
+    return str(frame_dir)
+
+
+def _debug_dump_algorithm_result(
+    *,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    result: AlgorithmRunResult,
+) -> str:
+    if not settings.debug_dump_enabled:
+        return ""
+    frame_count = _current_frame_count(car_id, stream_id)
+    result_dir = _debug_frame_dir(car_id, stream_id, frame_count) / "algorithms" / _safe_path_part(algorithm_id)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    result_payload = result.model_dump(mode="json", exclude={"annotated_image"})
+    result_payload["annotated_image_present"] = result.annotated_image is not None
+    result_payload["saved_at"] = time.time()
+    _write_json(result_dir / "result.json", result_payload)
+
+    outputs = result.outputs or {}
+    stdout = str(outputs.get("stdout", ""))
+    stderr = str(outputs.get("stderr", ""))
+    if stdout:
+        (result_dir / "stdout.txt").write_text(stdout, encoding="utf-8", errors="replace")
+    if stderr:
+        (result_dir / "stderr.txt").write_text(stderr, encoding="utf-8", errors="replace")
+
+    if settings.debug_save_algorithm_outputs and result.annotated_image is not None:
+        try:
+            (result_dir / "annotated.jpg").write_bytes(base64.b64decode(result.annotated_image.data))
+        except Exception:
+            logger.exception("failed to save debug annotated image for %s", algorithm_id)
+    if settings.debug_save_algorithm_outputs:
+        _copy_algorithm_output_files(outputs, result_dir / "outputs")
+
+    return str(result_dir)
+
+
+def _debug_dump_algorithm_error(
+    *,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    error: Exception,
+) -> str:
+    if not settings.debug_dump_enabled:
+        return ""
+    frame_count = _current_frame_count(car_id, stream_id)
+    result_dir = _debug_frame_dir(car_id, stream_id, frame_count) / "algorithms" / _safe_path_part(algorithm_id)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        result_dir / "error.json",
+        {
+            "event": "algorithm_error",
+            "car_id": car_id,
+            "stream_id": stream_id,
+            "algorithm_id": algorithm_id,
+            "error_type": error.__class__.__name__,
+            "error": str(error),
+            "saved_at": time.time(),
+        },
+    )
+    return str(result_dir)
+
+
+def _debug_frame_dir(car_id: str, stream_id: str, frame_count: int) -> Path:
+    return (
+        debug_dump_dir
+        / _safe_path_part(car_id)
+        / _safe_path_part(stream_id)
+        / f"frame_{frame_count:06d}"
+    )
+
+
+def _current_frame_count(car_id: str, stream_id: str) -> int:
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        return 0
+    return runtime.frame_count
+
+
+def _write_debug_image(path: Path, image) -> None:
+    ok = cv2.imwrite(str(path), image)
+    if not ok:
+        raise ValueError(f"failed to write debug image: {path}")
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _copy_algorithm_output_files(outputs: dict, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for key, value in outputs.items():
+        if key in {"stdout", "stderr", "returncode", "run_dir"} or not value:
+            continue
+        source = Path(str(value))
+        if not source.exists() or not source.is_file():
+            continue
+        target = target_dir / _safe_path_part(source.name)
+        try:
+            shutil.copy2(source, target)
+        except OSError:
+            logger.exception("failed to copy algorithm output file source=%s target=%s", source, target)
+
+
+def _safe_path_part(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value) or "unknown"
+
+
+def _summarize_detection_count(payload: dict) -> int | str:
+    for key in ("detection_count", "detections_count", "count"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+    detections = payload.get("detections")
+    if isinstance(detections, list):
+        return len(detections)
+    return "unknown"
 
 
 def _result_jpeg_bytes(result: AlgorithmRunResult) -> bytes | None:
