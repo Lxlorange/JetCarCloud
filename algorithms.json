@@ -1,3 +1,14 @@
 {
-  "algorithms": {}
+  "algorithms": {
+    "yolov5-similarity": {
+      "name": "YOLOv5 Similarity",
+      "runner": "docker",
+      "image": "model-yolov5-similarity:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {}
+    }
+  }
 }

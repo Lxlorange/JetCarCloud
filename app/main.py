@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import time
 
+import cv2
 import requests
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from app.algorithms import AlgorithmCatalog, AlgorithmService
@@ -306,6 +309,36 @@ async def run_stream_algorithm_once(
         raise HTTPException(status_code=500, detail=f"algorithm run failed: {exc}") from exc
 
 
+@app.get("/api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg")
+async def stream_algorithm_mjpeg(
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    fps: float = Query(default=1.0, ge=0.1, le=10.0),
+    publish_result: bool = True,
+    fallback_original: bool = True,
+) -> StreamingResponse:
+    if video_streams.get(car_id, stream_id) is None:
+        raise HTTPException(status_code=404, detail="video stream not registered")
+    try:
+        algorithm_service.catalog.require(algorithm_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    return StreamingResponse(
+        _algorithm_mjpeg_generator(
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            fps=fps,
+            publish_result=publish_result,
+            fallback_original=fallback_original,
+        ),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
 @app.post("/api/video/streams/{car_id}/{stream_id}/start", response_model=VideoStreamStatus)
 async def start_video_stream_worker(car_id: str, stream_id: str) -> VideoStreamStatus:
     runtime = video_streams.get(car_id, stream_id)
@@ -376,6 +409,65 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
     finally:
         if video_streams.get(car_id, stream_id) is not None:
             video_streams.mark_stopped(car_id, stream_id)
+
+
+async def _algorithm_mjpeg_generator(
+    *,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    fps: float,
+    publish_result: bool,
+    fallback_original: bool,
+):
+    interval = 1.0 / fps
+    while True:
+        started = time.perf_counter()
+        try:
+            frame = await asyncio.to_thread(_read_registered_stream_frame, car_id, stream_id)
+            result = await asyncio.to_thread(
+                algorithm_service.run_image,
+                algorithm_id=algorithm_id,
+                image=frame.image,
+                car_id=car_id,
+                stream_id=stream_id,
+                parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+                include_image=True,
+            )
+            if publish_result:
+                await manager.publish(car_id, result.model_dump(mode="json"))
+
+            jpeg = _result_jpeg_bytes(result)
+            if jpeg is None and fallback_original:
+                jpeg = _encode_jpeg_bytes(frame.image)
+            if jpeg is not None:
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-cache\r\n\r\n"
+                    + jpeg
+                    + b"\r\n"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            video_streams.mark_error(car_id, stream_id, str(exc))
+
+        elapsed = time.perf_counter() - started
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+def _result_jpeg_bytes(result: AlgorithmRunResult) -> bytes | None:
+    if result.annotated_image is None:
+        return None
+    return base64.b64decode(result.annotated_image.data)
+
+
+def _encode_jpeg_bytes(image) -> bytes:
+    ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    if not ok:
+        raise ValueError("failed to encode jpeg frame")
+    return encoded.tobytes()
 
 
 @app.websocket("/ws/inference/{car_id}/edge")

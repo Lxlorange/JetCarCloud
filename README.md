@@ -94,6 +94,40 @@ List algorithms:
 curl http://127.0.0.1:8000/api/algorithms
 ```
 
+## Build the YOLOv5 Similarity Image in WSL
+
+From WSL:
+
+```bash
+cd /mnt/d/2026_spring/car/model-yolov5-similarity
+docker build -t model-yolov5-similarity:v1 .
+```
+
+Register it in `JetCarCloud/algorithms.json`:
+
+```json
+{
+  "algorithms": {
+    "yolov5-similarity": {
+      "name": "YOLOv5 Similarity",
+      "runner": "docker",
+      "image": "model-yolov5-similarity:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {}
+    }
+  }
+}
+```
+
+Reload the catalog:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/algorithms/reload
+```
+
 ## Container Contract
 
 Cloud runs containers like this:
@@ -204,6 +238,51 @@ API:
 
 ```text
 POST /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/run-once
+```
+
+## Stream Processed Frames to the App
+
+JetCarCloud can expose a low-FPS MJPEG stream of algorithm-processed frames:
+
+```text
+GET /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg?fps=1
+```
+
+Example:
+
+```bash
+curl -v \
+  "http://127.0.0.1:8000/api/video/streams/car_001/camera_front/algorithms/yolov5-similarity/mjpeg?fps=1"
+```
+
+Open the same URL in a browser, VLC, or the mobile app image view. Each frame is
+captured from the registered video source, written to `/app/data/input/frame.jpg`,
+processed by the configured Docker image, and streamed back from
+`/app/data/output/annotated.jpg`.
+
+This is functional for preview and integration testing, but it starts a Docker
+container per frame. For higher real-time FPS, package the model as a persistent
+HTTP/gRPC service container and add a long-running runner later.
+
+## Update an Algorithm Image
+
+Rebuild with the same tag:
+
+```bash
+cd /mnt/d/2026_spring/car/model-yolov5-similarity
+docker build -t model-yolov5-similarity:v1 .
+```
+
+If you change the image tag, update `JetCarCloud/algorithms.json` and reload:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/algorithms/reload
+```
+
+If Docker cache keeps an old layer during development:
+
+```bash
+docker build --no-cache -t model-yolov5-similarity:v1 .
 ```
 
 ## Video Stream Background Mode
