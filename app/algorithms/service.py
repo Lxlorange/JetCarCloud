@@ -76,15 +76,28 @@ class AlgorithmService:
         if not ok:
             error = completed.stderr.strip() or completed.stdout.strip() or f"docker exited with {completed.returncode}"
 
+        input_files = _list_files(input_dir)
+        output_files = _list_files(output_dir)
         outputs = {
             "run_dir": str(run_dir),
+            "input_dir": str(input_dir),
+            "output_dir": str(output_dir),
+            "docker_command": getattr(completed, "command", completed.args),
             "stdout": completed.stdout,
             "stderr": completed.stderr,
             "returncode": completed.returncode,
+            "input_frame_shape": [int(item) for item in image.shape],
+            "input_files": input_files,
+            "output_files": output_files,
+            "missing_outputs": [],
         }
         for name in spec.outputs:
             path = output_dir / name
-            outputs[name] = str(path) if path.exists() else ""
+            if path.exists():
+                outputs[name] = str(path)
+            else:
+                outputs[name] = ""
+                outputs["missing_outputs"].append(name)
 
         return AlgorithmRunResult(
             ok=ok,
@@ -110,3 +123,23 @@ def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _list_files(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    items = []
+    for item in sorted(path.rglob("*")):
+        if not item.is_file():
+            continue
+        try:
+            size = item.stat().st_size
+        except OSError:
+            size = 0
+        items.append(
+            {
+                "path": str(item.relative_to(path)),
+                "size": int(size),
+            }
+        )
+    return items

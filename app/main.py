@@ -798,6 +798,21 @@ def _debug_dump_algorithm_result(
     result_payload["annotated_image_present"] = result.annotated_image is not None
     result_payload["saved_at"] = time.time()
     _write_json(result_dir / "result.json", result_payload)
+    _write_json(
+        result_dir / "diagnostics.json",
+        {
+            "docker_command": result.outputs.get("docker_command"),
+            "returncode": result.outputs.get("returncode"),
+            "run_dir": result.outputs.get("run_dir"),
+            "input_dir": result.outputs.get("input_dir"),
+            "output_dir": result.outputs.get("output_dir"),
+            "input_frame_shape": result.outputs.get("input_frame_shape"),
+            "input_files": result.outputs.get("input_files"),
+            "output_files": result.outputs.get("output_files"),
+            "missing_outputs": result.outputs.get("missing_outputs"),
+            "saved_at": time.time(),
+        },
+    )
 
     outputs = result.outputs or {}
     stdout = str(outputs.get("stdout", ""))

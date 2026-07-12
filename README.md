@@ -182,6 +182,20 @@ And should write:
 `result.json` can use any algorithm-specific JSON shape. JetCarCloud returns it
 under the `result` field without interpreting it.
 
+If an algorithm returns `docker exited with -11`, the container process crashed
+before writing outputs. Check the debug `diagnostics.json` for the exact
+`docker_command`, input files, output files, and missing outputs. Common causes:
+
+```text
+- Docker is still running an old image tag built before the current Dockerfile/code changes.
+- The image entrypoint still reads target.jpg/config.json instead of frame.jpg/request.json.
+- Native libraries inside the image crash before Python can print stderr.
+- The container writes result.jpg instead of annotated.jpg.
+```
+
+For WSL on this project, rebuild each model image after changing its Dockerfile
+or Python entrypoint, then keep the same image tag in `algorithms.json`.
+
 ## Run an Algorithm on an Uploaded Image
 
 ```bash
@@ -349,6 +363,12 @@ Rebuild with the same tag:
 ```bash
 cd /mnt/d/2026_spring/car/model-yolov5-similarity
 docker build -t model-yolov5-similarity:v1 .
+
+cd /mnt/d/2026_spring/car/model-yolov5-manhole-detect
+docker build -t model-yolov5-manhole-detect:v1 .
+
+cd /mnt/d/2026_spring/car/model-yolov8-road-damage
+docker build -t model-yolov8-road-damage:v1 .
 ```
 
 If you change the image tag, update `JetCarCloud/algorithms.json` and reload:
@@ -360,7 +380,14 @@ curl -X POST http://127.0.0.1:8000/api/algorithms/reload
 If Docker cache keeps an old layer during development:
 
 ```bash
+cd /mnt/d/2026_spring/car/model-yolov5-similarity
 docker build --no-cache -t model-yolov5-similarity:v1 .
+
+cd /mnt/d/2026_spring/car/model-yolov5-manhole-detect
+docker build --no-cache -t model-yolov5-manhole-detect:v1 .
+
+cd /mnt/d/2026_spring/car/model-yolov8-road-damage
+docker build --no-cache -t model-yolov8-road-damage:v1 .
 ```
 
 ## Video Stream Background Mode

@@ -24,10 +24,36 @@ class DockerAlgorithmRunner:
             f"{output_dir.resolve()}:/app/data/output",
             spec.image,
         ]
-        return subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=spec.timeout_seconds,
-        )
+
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=spec.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            stdout = _decode_output(exc.output)
+            stderr = _decode_output(exc.stderr)
+            if stderr:
+                stderr = f"{stderr}\n"
+            stderr = f"{stderr}docker timed out after {spec.timeout_seconds}s"
+            completed = subprocess.CompletedProcess(
+                command, returncode=124, stdout=stdout, stderr=stderr
+            )
+        except OSError as exc:
+            completed = subprocess.CompletedProcess(
+                command, returncode=127, stdout="", stderr=str(exc)
+            )
+
+        completed.command = command  # type: ignore[attr-defined]
+        return completed
+
+
+def _decode_output(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
