@@ -207,9 +207,44 @@ If `--include-image` is set and the container writes `annotated.jpg`,
 `annotated_image` contains a base64 JPEG `ImagePayload` that the mobile app can
 display directly.
 
-## Run an Algorithm on a Video Stream Frame
+## Push Edge Camera Frames
 
-Register a stream:
+In the real system, the edge side should push JPEG frames to Cloud over LAN.
+Cloud auto-creates or updates the stream when the first frame arrives:
+
+```text
+POST /api/video/streams/{car_id}/{stream_id}/frames
+```
+
+Payload:
+
+```json
+{
+  "car_id": "car_001",
+  "image": {
+    "encoding": "jpeg",
+    "width": 1280,
+    "height": 720,
+    "data": "base64-jpeg"
+  }
+}
+```
+
+For local integration without the car, push a repeated mock frame:
+
+```bash
+python scripts/push_frame.py \
+  --cloud http://127.0.0.1:8000 \
+  --car-id car_001 \
+  --stream-id camera_front \
+  --image /path/to/mock-frame.jpg \
+  --repeat \
+  --fps 1
+```
+
+## Register Pull-Based Camera Streams
+
+If the car exposes RTSP/MJPEG instead of pushing frames, register its LAN URL:
 
 ```bash
 python scripts/register_video_stream.py \
@@ -222,7 +257,11 @@ python scripts/register_video_stream.py \
   --height 640
 ```
 
-Run one frame:
+Local file paths are only for development when no car is available.
+
+## Run an Algorithm on One Video Frame
+
+Run one frame from the latest pushed frame or from a registered pull stream:
 
 ```bash
 python scripts/run_algorithm.py \
@@ -256,9 +295,9 @@ curl -v \
 ```
 
 Open the same URL in a browser, VLC, or the mobile app image view. Each frame is
-captured from the registered video source, written to `/app/data/input/frame.jpg`,
-processed by the configured Docker image, and streamed back from
-`/app/data/output/annotated.jpg`.
+read from the latest pushed edge frame or captured from the registered camera
+URL, written to `/app/data/input/frame.jpg`, processed by the configured Docker
+image, and streamed back from `/app/data/output/annotated.jpg`.
 
 This is functional for preview and integration testing, but it starts a Docker
 container per frame. For higher real-time FPS, package the model as a persistent

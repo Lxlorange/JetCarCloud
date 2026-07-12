@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import time
+from dataclasses import dataclass
 
 import cv2
 import requests
@@ -25,6 +26,7 @@ from app.schemas import (
     ReferenceUploadResult,
     SimilarityResult,
     VideoChunkUpload,
+    VideoFrameUploadResult,
     VideoFramePreprocessResult,
     VideoStreamConfig,
     VideoStreamStatus,
@@ -35,6 +37,7 @@ from app.video import (
     decode_video_chunk,
     encode_jpeg_payload,
     open_stream_frame,
+    preprocess_frame,
 )
 
 settings = get_settings()
@@ -57,6 +60,17 @@ app = FastAPI(title=settings.app_name)
 reference_images = {}
 video_streams = VideoStreamRegistry()
 stream_workers: dict[tuple[str, str], asyncio.Task] = {}
+
+
+@dataclass
+class ProcessedFrameCacheItem:
+    image: bytes
+    result: AlgorithmRunResult
+    timestamp: float
+
+
+processed_frames: dict[tuple[str, str, str], ProcessedFrameCacheItem] = {}
+processing_tasks: set[asyncio.Task] = set()
 
 
 @app.get("/health")
@@ -163,6 +177,12 @@ def _read_registered_stream_frame(car_id: str, stream_id: str):
         raise HTTPException(status_code=404, detail="video stream not registered")
 
     config = runtime.config
+    if config.transport == "push":
+        frame = video_streams.latest_frame(car_id, stream_id)
+        if frame is None:
+            raise HTTPException(status_code=404, detail="no pushed frame received yet")
+        return frame
+
     try:
         frame = open_stream_frame(
             config.url,
@@ -256,6 +276,23 @@ async def preprocess_video_chunk(payload: VideoChunkUpload) -> VideoFramePreproc
     )
 
 
+@app.post("/api/video/streams/{car_id}/{stream_id}/frames", response_model=VideoFrameUploadResult)
+async def push_video_frame(
+    car_id: str,
+    stream_id: str,
+    payload: ImageUpload,
+    algorithm_id: str | None = None,
+    include_image: bool = True,
+) -> VideoFrameUploadResult:
+    return await _accept_pushed_frame(
+        payload=payload,
+        car_id=car_id,
+        stream_id=stream_id,
+        algorithm_id=algorithm_id,
+        include_image=include_image,
+    )
+
+
 @app.get("/api/algorithms", response_model=list[AlgorithmInfo])
 async def list_algorithms() -> list[AlgorithmInfo]:
     return algorithm_service.catalog.list()
@@ -315,7 +352,6 @@ async def stream_algorithm_mjpeg(
     stream_id: str,
     algorithm_id: str,
     fps: float = Query(default=1.0, ge=0.1, le=10.0),
-    publish_result: bool = True,
     fallback_original: bool = True,
 ) -> StreamingResponse:
     if video_streams.get(car_id, stream_id) is None:
@@ -326,12 +362,11 @@ async def stream_algorithm_mjpeg(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return StreamingResponse(
-        _algorithm_mjpeg_generator(
+        _processed_mjpeg_generator(
             car_id=car_id,
             stream_id=stream_id,
             algorithm_id=algorithm_id,
             fps=fps,
-            publish_result=publish_result,
             fallback_original=fallback_original,
         ),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -400,6 +435,7 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
                         parameters={"preprocess": frame.metadata.model_dump(mode="json")},
                         include_image=False,
                     )
+                    _cache_processed_frame(car_id, stream_id, algorithm_id, result)
                     await manager.publish(car_id, result.model_dump(mode="json"))
             except Exception as exc:
                 video_streams.mark_error(car_id, stream_id, str(exc))
@@ -411,34 +447,26 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
             video_streams.mark_stopped(car_id, stream_id)
 
 
-async def _algorithm_mjpeg_generator(
+async def _processed_mjpeg_generator(
     *,
     car_id: str,
     stream_id: str,
     algorithm_id: str,
     fps: float,
-    publish_result: bool,
     fallback_original: bool,
 ):
     interval = 1.0 / fps
+    last_timestamp = 0.0
     while True:
         started = time.perf_counter()
         try:
-            frame = await asyncio.to_thread(_read_registered_stream_frame, car_id, stream_id)
-            result = await asyncio.to_thread(
-                algorithm_service.run_image,
-                algorithm_id=algorithm_id,
-                image=frame.image,
-                car_id=car_id,
-                stream_id=stream_id,
-                parameters={"preprocess": frame.metadata.model_dump(mode="json")},
-                include_image=True,
-            )
-            if publish_result:
-                await manager.publish(car_id, result.model_dump(mode="json"))
-
-            jpeg = _result_jpeg_bytes(result)
-            if jpeg is None and fallback_original:
+            cached = processed_frames.get((car_id, stream_id, algorithm_id))
+            jpeg = None
+            if cached is not None and cached.timestamp > last_timestamp:
+                jpeg = cached.image
+                last_timestamp = cached.timestamp
+            elif fallback_original:
+                frame = await asyncio.to_thread(_read_registered_stream_frame, car_id, stream_id)
                 jpeg = _encode_jpeg_bytes(frame.image)
             if jpeg is not None:
                 yield (
@@ -455,6 +483,154 @@ async def _algorithm_mjpeg_generator(
 
         elapsed = time.perf_counter() - started
         await asyncio.sleep(max(0.0, interval - elapsed))
+
+
+def _algorithm_ids_for_push(runtime, algorithm_id: str | None) -> list[str]:
+    if algorithm_id:
+        return [algorithm_id]
+    if runtime is None:
+        return []
+    configured = runtime.config.metadata.get("algorithms", [])
+    if isinstance(configured, str):
+        return [configured]
+    if isinstance(configured, list):
+        return [str(item) for item in configured if str(item)]
+    return []
+
+
+async def _accept_pushed_frame(
+    *,
+    payload: ImageUpload,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str | None,
+    include_image: bool,
+) -> VideoFrameUploadResult:
+    image = decode_jpeg(payload.image)
+    runtime = video_streams.get(car_id, stream_id)
+    if runtime is None:
+        config = VideoStreamConfig(
+            car_id=car_id,
+            stream_id=stream_id,
+            url=f"push://{car_id}/{stream_id}",
+            transport="push",
+            width=payload.image.width or settings.video_default_width,
+            height=payload.image.height or settings.video_default_height,
+            enabled=True,
+        )
+        video_streams.upsert(config)
+    else:
+        config = runtime.config
+        if config.transport != "push":
+            config = config.model_copy(update={"transport": "push", "url": f"push://{car_id}/{stream_id}"})
+            video_streams.upsert(config)
+
+    frame = preprocess_frame(
+        image,
+        width=payload.image.width or settings.video_default_width,
+        height=payload.image.height or settings.video_default_height,
+        source=f"push:{stream_id}",
+        letterbox=False,
+    )
+    video_streams.store_frame(car_id, stream_id, frame)
+    status = video_streams.status(car_id, stream_id)
+    algorithm_ids = _algorithm_ids_for_push(video_streams.get(car_id, stream_id), algorithm_id)
+    await manager.publish(
+        car_id,
+        {
+            "type": "video_frame",
+            "car_id": car_id,
+            "stream_id": stream_id,
+            "metadata": frame.metadata.model_dump(mode="json"),
+        },
+    )
+    _queue_algorithms_for_frame(
+        frame=frame,
+        car_id=car_id,
+        stream_id=stream_id,
+        algorithm_ids=algorithm_ids,
+        include_image=include_image,
+    )
+    return VideoFrameUploadResult(
+        car_id=car_id,
+        stream_id=stream_id,
+        frame_count=status.frame_count,
+        metadata=frame.metadata,
+        algorithms_queued=algorithm_ids,
+    )
+
+
+def _queue_algorithms_for_frame(
+    *,
+    frame,
+    car_id: str,
+    stream_id: str,
+    algorithm_ids: list[str],
+    include_image: bool,
+) -> None:
+    for algorithm_id in algorithm_ids:
+        task = asyncio.create_task(
+            _run_algorithm_for_pushed_frame(
+                frame=frame,
+                car_id=car_id,
+                stream_id=stream_id,
+                algorithm_id=algorithm_id,
+                include_image=include_image,
+            )
+        )
+        processing_tasks.add(task)
+        task.add_done_callback(processing_tasks.discard)
+
+
+async def _run_algorithm_for_pushed_frame(
+    *,
+    frame,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    include_image: bool,
+) -> None:
+    try:
+        result = await asyncio.to_thread(
+            algorithm_service.run_image,
+            algorithm_id=algorithm_id,
+            image=frame.image,
+            car_id=car_id,
+            stream_id=stream_id,
+            parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+            include_image=include_image,
+        )
+        _cache_processed_frame(car_id, stream_id, algorithm_id, result)
+        await manager.publish(car_id, result.model_dump(mode="json"))
+    except Exception as exc:
+        video_streams.mark_error(car_id, stream_id, str(exc))
+        await manager.publish(
+            car_id,
+            {
+                "type": "algorithm_result",
+                "ok": False,
+                "algorithm_id": algorithm_id,
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "runner": "docker",
+                "latency_ms": 0.0,
+                "result": {},
+                "outputs": {},
+                "annotated_image": None,
+                "error": str(exc),
+            },
+        )
+
+
+def _cache_processed_frame(car_id: str, stream_id: str, algorithm_id: str, result: AlgorithmRunResult) -> None:
+    jpeg = _result_jpeg_bytes(result)
+    if jpeg is None:
+        return
+    processed_frames[(car_id, stream_id, algorithm_id)] = ProcessedFrameCacheItem(
+        image=jpeg,
+        result=result,
+        timestamp=time.time(),
+    )
 
 
 def _result_jpeg_bytes(result: AlgorithmRunResult) -> bytes | None:
@@ -485,6 +661,31 @@ async def edge_socket(websocket: WebSocket, car_id: str) -> None:
             data = result.model_dump(mode="json")
             await websocket.send_json(data)
             await manager.publish(car_id, data)
+        except WebSocketDisconnect:
+            return
+        except ValidationError as exc:
+            await websocket.send_json({"type": "error", "message": exc.errors()})
+        except Exception as exc:
+            await websocket.send_json({"type": "error", "message": str(exc)})
+
+
+@app.websocket("/ws/video/{car_id}/{stream_id}/edge")
+async def edge_video_socket(websocket: WebSocket, car_id: str, stream_id: str) -> None:
+    await websocket.accept()
+    algorithm_id = websocket.query_params.get("algorithm_id")
+    include_image = websocket.query_params.get("include_image", "true").lower() != "false"
+    while True:
+        try:
+            raw = await websocket.receive_json()
+            payload = ImageUpload.model_validate(raw)
+            result = await _accept_pushed_frame(
+                payload=payload,
+                car_id=car_id,
+                stream_id=stream_id,
+                algorithm_id=algorithm_id,
+                include_image=include_image,
+            )
+            await websocket.send_json(result.model_dump(mode="json"))
         except WebSocketDisconnect:
             return
         except ValidationError as exc:

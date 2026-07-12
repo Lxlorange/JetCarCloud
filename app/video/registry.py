@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from app.video.processor import VideoFrame
 from app.schemas import VideoStreamConfig, VideoStreamStatus
 
 
@@ -13,6 +14,7 @@ class VideoStreamRuntime:
     frame_count: int = 0
     last_error: str = ""
     last_frame_at: float | None = None
+    latest_frame: VideoFrame | None = None
 
 
 class VideoStreamRegistry:
@@ -55,6 +57,18 @@ class VideoStreamRegistry:
         runtime.frame_count += 1
         runtime.last_frame_at = time.time()
         runtime.last_error = ""
+
+    def store_frame(self, car_id: str, stream_id: str, frame: VideoFrame) -> None:
+        runtime = self._streams[(car_id, stream_id)]
+        runtime.latest_frame = frame
+        runtime.running = True
+        self.mark_frame(car_id, stream_id)
+
+    def latest_frame(self, car_id: str, stream_id: str) -> VideoFrame | None:
+        runtime = self._streams.get((car_id, stream_id))
+        if runtime is None:
+            return None
+        return runtime.latest_frame
 
     def mark_error(self, car_id: str, stream_id: str, error: str) -> None:
         runtime = self._streams[(car_id, stream_id)]

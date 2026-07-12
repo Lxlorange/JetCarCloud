@@ -64,7 +64,7 @@ class VideoStreamConfig(BaseModel):
     car_id: str = Field(default="car_001", min_length=1)
     stream_id: str = Field(default="camera_front", min_length=1)
     url: str = Field(min_length=1)
-    transport: Literal["rtsp", "http_mjpeg", "http_file", "file", "unknown"] = "unknown"
+    transport: Literal["push", "rtsp", "http_mjpeg", "http_file", "file", "unknown"] = "unknown"
     width: int = Field(default=640, ge=64)
     height: int = Field(default=640, ge=64)
     fps: float = Field(default=2.0, ge=0.1, le=30.0)
@@ -103,6 +103,15 @@ class VideoFramePreprocessResult(BaseModel):
     stream_id: str = "camera_front"
     frame: ImagePayload
     metadata: VideoFrameMetadata
+
+
+class VideoFrameUploadResult(BaseModel):
+    ok: bool = True
+    car_id: str
+    stream_id: str = "camera_front"
+    frame_count: int
+    metadata: VideoFrameMetadata
+    algorithms_queued: list[str] = Field(default_factory=list)
 
 
 class VideoChunkUpload(BaseModel):
