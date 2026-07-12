@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from app.algorithms.catalog import AlgorithmCatalog
+from app.algorithms.local import LocalAlgorithmRunner
 from app.algorithms.runner import DockerAlgorithmRunner
 from app.schemas import AlgorithmRunResult
 from app.video import encode_jpeg_payload
@@ -24,7 +25,9 @@ class AlgorithmService:
     ) -> None:
         self._catalog = catalog
         self._work_dir = Path(work_dir)
+        self._project_root = Path(__file__).resolve().parents[2]
         self._docker_runner = DockerAlgorithmRunner(docker_executable=docker_executable)
+        self._local_runner = LocalAlgorithmRunner(project_root=self._project_root)
 
     @property
     def catalog(self) -> AlgorithmCatalog:
@@ -60,21 +63,69 @@ class AlgorithmService:
         (input_dir / "request.json").write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
 
         started = time.perf_counter()
-        completed = self._docker_runner.run(spec, input_dir=input_dir, output_dir=output_dir)
+        result_json: dict
+        annotated = None
+        error = ""
+        ok = True
+        runner_outputs: dict
+        if spec.runner == "local":
+            try:
+                result_json, annotated = self._local_runner.run(
+                    algorithm_id=algorithm_id,
+                    spec=spec,
+                    image=image,
+                    car_id=car_id,
+                    stream_id=stream_id,
+                    parameters=parameters,
+                )
+                _write_json(output_dir / "result.json", result_json)
+                if annotated is not None:
+                    _write_frame(output_dir / "annotated.jpg", annotated)
+                runner_outputs = {
+                    "runner": "local",
+                    "returncode": 0,
+                    "stdout": "",
+                    "stderr": "",
+                }
+            except Exception as exc:
+                ok = False
+                error = str(exc)
+                result_json = {
+                    "algorithm_id": algorithm_id,
+                    "car_id": car_id,
+                    "stream_id": stream_id,
+                    "error": str(exc),
+                }
+                _write_json(output_dir / "result.json", result_json)
+                runner_outputs = {
+                    "runner": "local",
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": str(exc),
+                }
+        elif spec.runner == "docker":
+            completed = self._docker_runner.run(spec, input_dir=input_dir, output_dir=output_dir)
+            result_json = _read_json(output_dir / "result.json")
+            annotated_path = output_dir / "annotated.jpg"
+            if annotated_path.exists():
+                annotated = cv2.imread(str(annotated_path))
+            ok = completed.returncode == 0
+            if not ok:
+                error = completed.stderr.strip() or completed.stdout.strip() or f"docker exited with {completed.returncode}"
+            runner_outputs = {
+                "runner": "docker",
+                "docker_command": getattr(completed, "command", completed.args),
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "returncode": completed.returncode,
+            }
+        else:
+            raise ValueError(f"unsupported algorithm runner: {spec.runner}")
         latency_ms = (time.perf_counter() - started) * 1000.0
 
-        result_json = _read_json(output_dir / "result.json")
         annotated_image = None
-        annotated_path = output_dir / "annotated.jpg"
-        if include_image and annotated_path.exists():
-            annotated = cv2.imread(str(annotated_path))
-            if annotated is not None:
-                annotated_image = encode_jpeg_payload(annotated)
-
-        ok = completed.returncode == 0
-        error = ""
-        if not ok:
-            error = completed.stderr.strip() or completed.stdout.strip() or f"docker exited with {completed.returncode}"
+        if include_image and annotated is not None:
+            annotated_image = encode_jpeg_payload(annotated)
 
         input_files = _list_files(input_dir)
         output_files = _list_files(output_dir)
@@ -82,15 +133,12 @@ class AlgorithmService:
             "run_dir": str(run_dir),
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
-            "docker_command": getattr(completed, "command", completed.args),
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "returncode": completed.returncode,
             "input_frame_shape": [int(item) for item in image.shape],
             "input_files": input_files,
             "output_files": output_files,
             "missing_outputs": [],
         }
+        outputs.update(runner_outputs)
         for name in spec.outputs:
             path = output_dir / name
             if path.exists():
@@ -123,6 +171,10 @@ def _read_json(path: Path) -> dict:
     if not path.exists():
         return {}
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _list_files(path: Path) -> list[dict]:

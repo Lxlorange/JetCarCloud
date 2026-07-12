@@ -111,7 +111,9 @@ class VideoFrameUploadResult(BaseModel):
     stream_id: str = "camera_front"
     frame_count: int
     metadata: VideoFrameMetadata
+    frame_accepted: bool = True
     algorithms_queued: list[str] = Field(default_factory=list)
+    algorithms_skipped: list[dict] = Field(default_factory=list)
 
 
 class VideoChunkUpload(BaseModel):
@@ -133,7 +135,7 @@ class AlgorithmRunRequest(BaseModel):
 class AlgorithmInfo(BaseModel):
     algorithm_id: str
     name: str = ""
-    runner: Literal["docker"] = "docker"
+    runner: Literal["docker", "local"] = "local"
     image: str = ""
     inputs: list[str] = Field(default_factory=list)
     outputs: list[str] = Field(default_factory=list)
@@ -148,7 +150,7 @@ class AlgorithmRunResult(BaseModel):
     algorithm_id: str
     car_id: str = "car_001"
     stream_id: str = "upload"
-    runner: str = "docker"
+    runner: str = "local"
     latency_ms: float = 0.0
     result: dict = Field(default_factory=dict)
     outputs: dict = Field(default_factory=dict)

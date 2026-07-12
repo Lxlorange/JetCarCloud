@@ -2,36 +2,52 @@
   "algorithms": {
     "yolov5-similarity": {
       "name": "YOLOv5 Similarity",
-      "runner": "docker",
-      "image": "model-yolov5-similarity:v1",
-      "inputs": ["frame.jpg", "request.json"],
-      "outputs": ["result.json", "annotated.jpg"],
-      "timeout_seconds": 60,
-      "enabled": true,
-      "metadata": {}
-    },
-    "yolov5-manhole-detect": {
-      "name": "YOLOv5 Manhole Detection",
-      "runner": "docker",
-      "image": "model-yolov5-manhole-detect:v1",
+      "runner": "local",
+      "image": "",
       "inputs": ["frame.jpg", "request.json"],
       "outputs": ["result.json", "annotated.jpg"],
       "timeout_seconds": 60,
       "enabled": true,
       "metadata": {
-        "task": "manhole_detection"
+        "task": "similarity",
+        "model_path": "models/yolov5-similarity/yolov5s.pt",
+        "template_path": "models/yolov5-similarity/target.jpg",
+        "threshold": 0.45
+      }
+    },
+    "yolov5-manhole-detect": {
+      "name": "YOLOv5 Manhole Detection",
+      "runner": "local",
+      "image": "",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {
+        "task": "manhole_detection",
+        "model_path": "models/yolov5-manhole/Manhole_model.pt",
+        "source_dir": "models/yolov5-manhole/src",
+        "img_size": 640,
+        "conf_threshold": 0.25,
+        "iou_threshold": 0.45,
+        "device": ""
       }
     },
     "yolov8-road-damage": {
       "name": "YOLOv8 Road Damage Detection",
-      "runner": "docker",
-      "image": "model-yolov8-road-damage:v1",
+      "runner": "local",
+      "image": "",
       "inputs": ["frame.jpg", "request.json"],
       "outputs": ["result.json", "annotated.jpg"],
       "timeout_seconds": 60,
       "enabled": true,
       "metadata": {
-        "task": "road_damage_detection"
+        "task": "road_damage_detection",
+        "model_path": "models/yolov8-road-damage/YOLOv8_Small_2nd_Model.pt",
+        "imgsz": 640,
+        "conf": 0.2,
+        "iou": 0.45,
+        "device": "cpu"
       }
     }
   }

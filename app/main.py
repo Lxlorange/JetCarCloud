@@ -77,6 +77,8 @@ class ProcessedFrameCacheItem:
 
 processed_frames: dict[tuple[str, str, str], ProcessedFrameCacheItem] = {}
 processing_tasks: set[asyncio.Task] = set()
+processing_tasks_by_key: dict[tuple[str, str, str], asyncio.Task] = {}
+algorithm_last_started_at: dict[tuple[str, str, str], float] = {}
 debug_dump_dir = Path(settings.debug_dump_dir)
 
 
@@ -472,19 +474,21 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
                     "metadata": frame.metadata.model_dump(mode="json"),
                 }
                 await manager.publish(car_id, frame_event)
-                algorithm_ids = config.metadata.get("algorithms", [])
-                for algorithm_id in algorithm_ids:
-                    result = await asyncio.to_thread(
-                        algorithm_service.run_image,
-                        algorithm_id=algorithm_id,
-                        image=frame.image,
-                        car_id=car_id,
-                        stream_id=stream_id,
-                        parameters={"preprocess": frame.metadata.model_dump(mode="json")},
-                        include_image=False,
-                    )
-                    _cache_processed_frame(car_id, stream_id, algorithm_id, result)
-                    await manager.publish(car_id, result.model_dump(mode="json"))
+                algorithm_ids = _algorithm_ids_for_push(runtime, None, None)
+                queued, skipped = _queue_algorithms_for_frame(
+                    frame=frame,
+                    car_id=car_id,
+                    stream_id=stream_id,
+                    algorithm_ids=algorithm_ids,
+                    include_image=False,
+                )
+                logger.info(
+                    "stream worker sampled frame car_id=%s stream_id=%s queued=%s skipped=%s",
+                    car_id,
+                    stream_id,
+                    queued,
+                    skipped,
+                )
             except Exception as exc:
                 video_streams.mark_error(car_id, stream_id, str(exc))
             await asyncio.sleep(max(0.033, config.sample_interval_ms / 1000.0))
@@ -562,8 +566,24 @@ async def _accept_pushed_frame(
     algorithm_ids: str | None,
     include_image: bool,
 ) -> VideoFrameUploadResult:
-    image = decode_jpeg(payload.image)
     runtime = video_streams.get(car_id, stream_id)
+    requested_algorithm_ids = _algorithm_ids_for_push(runtime, algorithm_id, algorithm_ids)
+    for item in requested_algorithm_ids:
+        try:
+            algorithm_service.catalog.require(item)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    throttle_result = _throttled_push_result(
+        runtime=runtime,
+        car_id=car_id,
+        stream_id=stream_id,
+        algorithm_ids=requested_algorithm_ids,
+    )
+    if throttle_result is not None:
+        return throttle_result
+
+    image = decode_jpeg(payload.image)
     if runtime is None:
         config = VideoStreamConfig(
             car_id=car_id,
@@ -590,12 +610,13 @@ async def _accept_pushed_frame(
     )
     video_streams.store_frame(car_id, stream_id, frame)
     status = video_streams.status(car_id, stream_id)
-    queued_algorithm_ids = _algorithm_ids_for_push(video_streams.get(car_id, stream_id), algorithm_id, algorithm_ids)
-    for item in queued_algorithm_ids:
-        try:
-            algorithm_service.catalog.require(item)
-        except KeyError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    queued_algorithm_ids, skipped_algorithm_ids = _queue_algorithms_for_frame(
+        frame=frame,
+        car_id=car_id,
+        stream_id=stream_id,
+        algorithm_ids=requested_algorithm_ids,
+        include_image=include_image,
+    )
     debug_frame_dir = _debug_dump_received_frame(
         car_id=car_id,
         stream_id=stream_id,
@@ -603,10 +624,12 @@ async def _accept_pushed_frame(
         image=image,
         frame=frame,
         payload=payload,
-        algorithm_ids=queued_algorithm_ids,
+        requested_algorithm_ids=requested_algorithm_ids,
+        queued_algorithm_ids=queued_algorithm_ids,
+        skipped_algorithm_ids=skipped_algorithm_ids,
     )
     logger.info(
-        "received frame car_id=%s stream_id=%s frame_count=%s image=%sx%s processed=%sx%s algorithms=%s debug_dir=%s",
+        "received frame car_id=%s stream_id=%s frame_count=%s image=%sx%s processed=%sx%s queued=%s skipped=%s debug_dir=%s",
         car_id,
         stream_id,
         status.frame_count,
@@ -615,6 +638,7 @@ async def _accept_pushed_frame(
         frame.metadata.resized_width,
         frame.metadata.resized_height,
         queued_algorithm_ids,
+        skipped_algorithm_ids,
         debug_frame_dir or "",
     )
     await manager.publish(
@@ -626,19 +650,14 @@ async def _accept_pushed_frame(
             "metadata": frame.metadata.model_dump(mode="json"),
         },
     )
-    _queue_algorithms_for_frame(
-        frame=frame,
-        car_id=car_id,
-        stream_id=stream_id,
-        algorithm_ids=queued_algorithm_ids,
-        include_image=include_image,
-    )
     return VideoFrameUploadResult(
         car_id=car_id,
         stream_id=stream_id,
         frame_count=status.frame_count,
         metadata=frame.metadata,
+        frame_accepted=True,
         algorithms_queued=queued_algorithm_ids,
+        algorithms_skipped=skipped_algorithm_ids,
     )
 
 
@@ -649,8 +668,42 @@ def _queue_algorithms_for_frame(
     stream_id: str,
     algorithm_ids: list[str],
     include_image: bool,
-) -> None:
+) -> tuple[list[str], list[dict]]:
+    queued: list[str] = []
+    skipped: list[dict] = []
     for algorithm_id in algorithm_ids:
+        key = (car_id, stream_id, algorithm_id)
+        running = processing_tasks_by_key.get(key)
+        if running is not None and not running.done():
+            skipped.append({"algorithm_id": algorithm_id, "reason": "algorithm_busy"})
+            continue
+
+        active_tasks = sum(1 for task in processing_tasks if not task.done())
+        if active_tasks >= settings.algorithm_max_concurrent_tasks:
+            skipped.append(
+                {
+                    "algorithm_id": algorithm_id,
+                    "reason": "global_algorithm_limit",
+                    "active_tasks": active_tasks,
+                    "limit": settings.algorithm_max_concurrent_tasks,
+                }
+            )
+            continue
+
+        now = time.monotonic()
+        min_interval = settings.algorithm_min_interval_ms / 1000.0
+        last_started = algorithm_last_started_at.get(key, 0.0)
+        if min_interval > 0 and now - last_started < min_interval:
+            skipped.append(
+                {
+                    "algorithm_id": algorithm_id,
+                    "reason": "algorithm_rate_limited",
+                    "retry_after_ms": int(max(0.0, min_interval - (now - last_started)) * 1000),
+                }
+            )
+            continue
+
+        algorithm_last_started_at[key] = now
         task = asyncio.create_task(
             _run_algorithm_for_pushed_frame(
                 frame=frame,
@@ -661,7 +714,53 @@ def _queue_algorithms_for_frame(
             )
         )
         processing_tasks.add(task)
+        processing_tasks_by_key[key] = task
         task.add_done_callback(processing_tasks.discard)
+        task.add_done_callback(lambda completed, task_key=key: processing_tasks_by_key.pop(task_key, None))
+        queued.append(algorithm_id)
+    return queued, skipped
+
+
+def _throttled_push_result(
+    *,
+    runtime,
+    car_id: str,
+    stream_id: str,
+    algorithm_ids: list[str],
+) -> VideoFrameUploadResult | None:
+    if runtime is None or runtime.latest_frame is None or runtime.last_frame_at is None:
+        return None
+
+    min_interval = settings.video_push_min_interval_ms / 1000.0
+    elapsed = time.time() - runtime.last_frame_at
+    if min_interval <= 0 or elapsed >= min_interval:
+        return None
+
+    retry_after_ms = int(max(0.0, min_interval - elapsed) * 1000)
+    skipped = [
+        {
+            "algorithm_id": item,
+            "reason": "input_rate_limited",
+            "retry_after_ms": retry_after_ms,
+        }
+        for item in algorithm_ids
+    ]
+    logger.info(
+        "dropped pushed frame car_id=%s stream_id=%s reason=input_rate_limited retry_after_ms=%s algorithms=%s",
+        car_id,
+        stream_id,
+        retry_after_ms,
+        algorithm_ids,
+    )
+    return VideoFrameUploadResult(
+        car_id=car_id,
+        stream_id=stream_id,
+        frame_count=runtime.frame_count,
+        metadata=runtime.latest_frame.metadata,
+        frame_accepted=False,
+        algorithms_queued=[],
+        algorithms_skipped=skipped,
+    )
 
 
 async def _run_algorithm_for_pushed_frame(
@@ -725,7 +824,7 @@ async def _run_algorithm_for_pushed_frame(
                 "algorithm_id": algorithm_id,
                 "car_id": car_id,
                 "stream_id": stream_id,
-                "runner": "docker",
+                "runner": "local",
                 "latency_ms": 0.0,
                 "result": {},
                 "outputs": {},
@@ -754,9 +853,13 @@ def _debug_dump_received_frame(
     image,
     frame,
     payload: ImageUpload,
-    algorithm_ids: list[str],
+    requested_algorithm_ids: list[str],
+    queued_algorithm_ids: list[str],
+    skipped_algorithm_ids: list[dict],
 ) -> str:
     if not settings.debug_dump_enabled:
+        return ""
+    if not queued_algorithm_ids and skipped_algorithm_ids and not settings.debug_dump_skipped_frames:
         return ""
     frame_dir = _debug_frame_dir(car_id, stream_id, frame_count)
     frame_dir.mkdir(parents=True, exist_ok=True)
@@ -772,7 +875,9 @@ def _debug_dump_received_frame(
             "base64_length": len(payload.image.data),
         },
         "processed_metadata": frame.metadata.model_dump(mode="json"),
-        "algorithms_queued": algorithm_ids,
+        "algorithms_requested": requested_algorithm_ids,
+        "algorithms_queued": queued_algorithm_ids,
+        "algorithms_skipped": skipped_algorithm_ids,
         "saved_at": time.time(),
     }
     _write_json(frame_dir / "frame_metadata.json", metadata)

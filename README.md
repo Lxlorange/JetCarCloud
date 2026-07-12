@@ -1,9 +1,9 @@
 # JetCarCloud
 
 JetCarCloud is the WSL/cloud-side service for JetCar. It handles app/edge
-networking, image/video preprocessing, and algorithm dispatch. Model code is not
-loaded directly by the cloud service anymore. Each model should be packaged as a
-Docker image and registered in `algorithms.json`.
+networking, image/video preprocessing, and algorithm dispatch. The current
+runtime loads the three road-inspection models directly inside the WSL Python
+process; Docker is no longer required for these algorithms.
 
 API document: [docs/cloud_api.md](docs/cloud_api.md)
 
@@ -11,15 +11,15 @@ API document: [docs/cloud_api.md](docs/cloud_api.md)
 
 ```text
 JetCarCloud/
-  algorithms.json           Empty runtime algorithm catalog
-  algorithms.example.json   Example catalog entries
+  algorithms.json           Runtime algorithm catalog
   app/
     main.py                 FastAPI routes
     config.py               Environment configuration
     schemas.py              Pydantic message models
     algorithms/
-      catalog.py            Loads algorithm_id -> image/io mapping
-      runner.py             Docker command runner
+      catalog.py            Loads algorithm_id -> runner/model mapping
+      local/                In-process YOLO/OpenCV algorithm implementations
+      runner.py             Legacy Docker command runner
       service.py            Prepares input/output dirs and reads results
     video/
       processor.py          Frame decoding, preprocessing, JPEG encoding
@@ -28,6 +28,10 @@ JetCarCloud/
   scripts/
     register_video_stream.py
     run_algorithm.py
+  models/
+    yolov5-manhole/         Manhole YOLOv5 weights and source
+    yolov8-road-damage/     Road-damage YOLOv8 weights
+    yolov5-similarity/      Similarity template and weights
 ```
 
 ## Setup
@@ -55,29 +59,23 @@ curl http://127.0.0.1:8000/health
 
 ## Algorithm Catalog
 
-`algorithms.json` is intentionally empty by default:
-
-```json
-{
-  "algorithms": {}
-}
-```
-
-Add model containers by copying entries from `algorithms.example.json`:
+The default catalog uses local runners:
 
 ```json
 {
   "algorithms": {
-    "road-inspection": {
-      "name": "Road Inspection",
-      "runner": "docker",
-      "image": "jetcar-road-inspection:v1",
+    "yolov8-road-damage": {
+      "name": "YOLOv8 Road Damage Detection",
+      "runner": "local",
+      "image": "",
       "inputs": ["frame.jpg", "request.json"],
       "outputs": ["result.json", "annotated.jpg"],
-      "timeout_seconds": 90,
+      "timeout_seconds": 60,
       "enabled": true,
       "metadata": {
-        "task": "run multiple road inspection models in one container"
+        "task": "road_damage_detection",
+        "model_path": "models/yolov8-road-damage/YOLOv8_Small_2nd_Model.pt",
+        "device": "cpu"
       }
     }
   }
@@ -96,112 +94,23 @@ List algorithms:
 curl http://127.0.0.1:8000/api/algorithms
 ```
 
-## Build the YOLOv5 Similarity Image in WSL
-
-From WSL:
-
-```bash
-cd /mnt/d/2026_spring/car/model-yolov5-similarity
-docker build -t model-yolov5-similarity:v1 .
-```
-
-Register it in `JetCarCloud/algorithms.json`:
-
-```json
-{
-  "algorithms": {
-    "yolov5-similarity": {
-      "name": "YOLOv5 Similarity",
-      "runner": "docker",
-      "image": "model-yolov5-similarity:v1",
-      "inputs": ["frame.jpg", "request.json"],
-      "outputs": ["result.json", "annotated.jpg"],
-      "timeout_seconds": 60,
-      "enabled": true,
-      "metadata": {}
-    }
-  }
-}
-```
-
-Reload the catalog:
-
-```bash
-curl -X POST http://127.0.0.1:8000/api/algorithms/reload
-```
-
-The current runtime catalog registers these Docker images:
+The current runtime catalog registers these local algorithms:
 
 ```text
-yolov5-similarity       -> model-yolov5-similarity:v1
-yolov5-manhole-detect  -> model-yolov5-manhole-detect:v1
-yolov8-road-damage     -> model-yolov8-road-damage:v1
+yolov5-similarity       -> OpenCV feature similarity, template under models/yolov5-similarity/
+yolov5-manhole-detect  -> YOLOv5, weights under models/yolov5-manhole/
+yolov8-road-damage     -> Ultralytics YOLOv8, weights under models/yolov8-road-damage/
 ```
 
 Adding another model should only require adding one entry to `algorithms.json`
-as long as the container follows the contract below.
-
-## Container Contract
-
-Cloud runs containers like this:
-
-```bash
-docker run --rm \
-  -v "/host/run/input:/app/data/input" \
-  -v "/host/run/output:/app/data/output" \
-  your-image:v1
-```
-
-Each algorithm container should read:
-
-```text
-/app/data/input/frame.jpg
-/app/data/input/request.json
-```
-
-And should write:
-
-```text
-/app/data/output/result.json
-/app/data/output/annotated.jpg        optional
-```
-
-`request.json` contains:
-
-```json
-{
-  "algorithm_id": "road-inspection",
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "parameters": {},
-  "input_dir": "/app/data/input",
-  "output_dir": "/app/data/output"
-}
-```
-
-`result.json` can use any algorithm-specific JSON shape. JetCarCloud returns it
-under the `result` field without interpreting it.
-
-If an algorithm returns `docker exited with -11`, the container process crashed
-before writing outputs. Check the debug `diagnostics.json` for the exact
-`docker_command`, input files, output files, and missing outputs. Common causes:
-
-```text
-- Docker is still running an old image tag built before the current Dockerfile/code changes.
-- The image entrypoint still reads target.jpg/config.json instead of frame.jpg/request.json.
-- Native libraries inside the image crash before Python can print stderr.
-- The container writes result.jpg instead of annotated.jpg.
-```
-
-For WSL on this project, rebuild each model image after changing its Dockerfile
-or Python entrypoint, then keep the same image tag in `algorithms.json`.
+and implementing a matching local runner under `app/algorithms/local/`.
 
 ## Run an Algorithm on an Uploaded Image
 
 ```bash
 python scripts/run_algorithm.py \
   --cloud http://127.0.0.1:8000 \
-  --algorithm-id road-inspection \
+  --algorithm-id yolov8-road-damage \
   --image /path/to/road-test.jpg \
   --include-image
 ```
@@ -218,10 +127,10 @@ The response is:
 {
   "type": "algorithm_result",
   "ok": true,
-  "algorithm_id": "road-inspection",
+  "algorithm_id": "yolov8-road-damage",
   "car_id": "car_001",
   "stream_id": "upload",
-  "runner": "docker",
+  "runner": "local",
   "latency_ms": 1234.5,
   "result": {},
   "outputs": {},
@@ -230,7 +139,7 @@ The response is:
 }
 ```
 
-If `--include-image` is set and the container writes `annotated.jpg`,
+If `--include-image` is set and the local runner returns an annotated frame,
 `annotated_image` contains a base64 JPEG `ImagePayload` that the mobile app can
 display directly.
 
@@ -260,6 +169,22 @@ For WebSocket push, use the same query parameters:
 ```text
 ws://<cloud-ip>:8000/ws/video/car_001/camera_front/edge?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage
 ```
+
+Realtime push is intentionally throttled. Cloud keeps the latest accepted frame,
+but it does not run every incoming frame through every model:
+
+```text
+VIDEO_PUSH_MIN_INTERVAL_MS=200       # accept at most about 5 pushed frames/s per stream
+ALGORITHM_MIN_INTERVAL_MS=1000       # start each algorithm at most about 1 time/s per stream
+ALGORITHM_MAX_CONCURRENT_TASKS=2     # total algorithm tasks running at the same time
+DEBUG_DUMP_SKIPPED_FRAMES=false      # skipped frames are not written to .jetcar_debug
+```
+
+If a frame is dropped by the input limiter, the upload response has
+`frame_accepted=false`. If a frame is accepted but an algorithm is already busy
+or rate-limited, `algorithms_skipped` explains the reason. Skipped frames are not
+queued; this protects WSL from process buildup and keeps the service using the
+newest frame.
 
 Payload:
 
@@ -311,7 +236,7 @@ Run one frame from the latest pushed frame or from a registered pull stream:
 ```bash
 python scripts/run_algorithm.py \
   --cloud http://127.0.0.1:8000 \
-  --algorithm-id road-inspection \
+  --algorithm-id yolov8-road-damage \
   --car-id car_001 \
   --stream-id camera_front \
   --stream \
@@ -341,8 +266,8 @@ curl -v \
 
 Open the same URL in a browser, VLC, or the mobile app image view. Each frame is
 read from the latest pushed edge frame or captured from the registered camera
-URL, written to `/app/data/input/frame.jpg`, processed by the configured Docker
-image, and streamed back from `/app/data/output/annotated.jpg`.
+URL, processed by the configured local runner, and streamed back from the latest
+cached annotated frame.
 
 Each MJPEG URL shows one algorithm's processed frames. If the edge side triggers
 both manhole and road-damage algorithms, open one URL per algorithm:
@@ -352,42 +277,24 @@ http://<cloud-ip>:8000/api/video/streams/car_001/camera_front/algorithms/yolov5-
 http://<cloud-ip>:8000/api/video/streams/car_001/camera_front/algorithms/yolov8-road-damage/mjpeg?fps=5
 ```
 
-This is functional for preview and integration testing, but it starts a Docker
-container per frame. For higher real-time FPS, package the model as a persistent
-HTTP/gRPC service container and add a long-running runner later.
+This is intended for low-FPS preview. The local models are loaded once and then
+reused, but the push limiter still controls how often inference is started.
 
-## Update an Algorithm Image
+## Update an Algorithm Model
 
-Rebuild with the same tag:
+Replace the local model file referenced by `algorithms.json`, then restart
+JetCarCloud so the in-memory model is reloaded:
 
-```bash
-cd /mnt/d/2026_spring/car/model-yolov5-similarity
-docker build -t model-yolov5-similarity:v1 .
-
-cd /mnt/d/2026_spring/car/model-yolov5-manhole-detect
-docker build -t model-yolov5-manhole-detect:v1 .
-
-cd /mnt/d/2026_spring/car/model-yolov8-road-damage
-docker build -t model-yolov8-road-damage:v1 .
+```text
+models/yolov5-manhole/Manhole_model.pt
+models/yolov8-road-damage/YOLOv8_Small_2nd_Model.pt
+models/yolov5-similarity/target.jpg
 ```
 
-If you change the image tag, update `JetCarCloud/algorithms.json` and reload:
+If you only change `algorithms.json`, reload the catalog:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/algorithms/reload
-```
-
-If Docker cache keeps an old layer during development:
-
-```bash
-cd /mnt/d/2026_spring/car/model-yolov5-similarity
-docker build --no-cache -t model-yolov5-similarity:v1 .
-
-cd /mnt/d/2026_spring/car/model-yolov5-manhole-detect
-docker build --no-cache -t model-yolov5-manhole-detect:v1 .
-
-cd /mnt/d/2026_spring/car/model-yolov8-road-damage
-docker build --no-cache -t model-yolov8-road-damage:v1 .
 ```
 
 ## Video Stream Background Mode
@@ -409,7 +316,7 @@ background, include algorithm IDs in the stream metadata when registering it:
   "url": "rtsp://192.168.10.50:8554/camera",
   "transport": "rtsp",
   "metadata": {
-    "algorithms": ["road-inspection"]
+    "algorithms": ["yolov8-road-damage"]
   }
 }
 ```
