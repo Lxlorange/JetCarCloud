@@ -5,6 +5,8 @@ networking, image/video preprocessing, and algorithm dispatch. Model code is not
 loaded directly by the cloud service anymore. Each model should be packaged as a
 Docker image and registered in `algorithms.json`.
 
+API document: [docs/cloud_api.md](docs/cloud_api.md)
+
 ## Repository Layout
 
 ```text
