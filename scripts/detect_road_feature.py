@@ -1,64 +1,12 @@
 from __future__ import annotations
 
-import argparse
-import base64
-from pathlib import Path
+"""Compatibility wrapper.
 
-import cv2
-import requests
+Use:
+  python scripts/detect_road_feature.py --algorithm-id road-inspection --image ...
+"""
 
-
-FEATURE_PATHS = {
-    "manhole": "manhole",
-    "road-defect": "road-defect",
-    "road-inspection": "road-inspection",
-}
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Call JetCarCloud road feature detection APIs.")
-    parser.add_argument("--cloud", default="http://127.0.0.1:8000")
-    parser.add_argument("--feature", choices=sorted(FEATURE_PATHS), default="road-inspection")
-    parser.add_argument("--car-id", default="car_001")
-    parser.add_argument("--stream-id", default="camera_front")
-    parser.add_argument("--image", help="Local image path for upload-based detection.")
-    parser.add_argument("--stream", action="store_true", help="Run detection once on a registered video stream.")
-    parser.add_argument("--include-image", action="store_true", help="Ask cloud to return an annotated JPEG payload.")
-    args = parser.parse_args()
-
-    base_url = args.cloud.rstrip("/")
-    feature_path = FEATURE_PATHS[args.feature]
-    if args.stream:
-        url = f"{base_url}/api/video/streams/{args.car_id}/{args.stream_id}/features/{feature_path}/run-once"
-        response = requests.post(url, params={"include_image": args.include_image}, timeout=60)
-    else:
-        if not args.image:
-            raise SystemExit("--image is required unless --stream is set")
-        payload = _image_payload(Path(args.image), args.car_id, include_image=args.include_image)
-        response = requests.post(f"{base_url}/api/features/{feature_path}/detect", json=payload, timeout=60)
-
-    response.raise_for_status()
-    print(response.json())
-
-
-def _image_payload(path: Path, car_id: str, *, include_image: bool) -> dict:
-    image = cv2.imread(str(path))
-    if image is None:
-        raise SystemExit(f"failed to read image: {path}")
-    height, width = image.shape[:2]
-    ok, encoded = cv2.imencode(".jpg", image)
-    if not ok:
-        raise SystemExit(f"failed to encode image: {path}")
-    return {
-        "car_id": car_id,
-        "include_image": include_image,
-        "image": {
-            "encoding": "jpeg",
-            "width": int(width),
-            "height": int(height),
-            "data": base64.b64encode(encoded.tobytes()).decode("ascii"),
-        },
-    }
+from run_algorithm import main
 
 
 if __name__ == "__main__":

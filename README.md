@@ -1,46 +1,34 @@
 # JetCarCloud
 
-JetCarCloud is the cloud/WSL-side inference service for JetCar. It receives
-camera frames from the Jetson edge node, runs object detection, and distributes
-the result to both the edge node and any app clients subscribed to the same
-`car_id`.
-
-## Technology Choice
-
-- Runtime: WSL2 Ubuntu 22.04 or a Linux server.
-- Web framework: FastAPI, because it provides HTTP health checks and native
-  WebSocket handling with a small amount of code.
-- Inference: Ultralytics YOLO when a model path is configured. The service also
-  has a no-op detector fallback so networking can be tested before model setup.
-- Image processing: OpenCV + NumPy for base64 JPEG decoding.
-- Configuration: environment variables and `.env.example`.
-
-The service does not store data by default. It acts as a live inference relay.
+JetCarCloud is the WSL/cloud-side service for JetCar. It handles app/edge
+networking, image/video preprocessing, and algorithm dispatch. Model code is not
+loaded directly by the cloud service anymore. Each model should be packaged as a
+Docker image and registered in `algorithms.json`.
 
 ## Repository Layout
 
 ```text
 JetCarCloud/
+  algorithms.json           Empty runtime algorithm catalog
+  algorithms.example.json   Example catalog entries
   app/
-    main.py                 FastAPI app and WebSocket routes
+    main.py                 FastAPI routes
     config.py               Environment configuration
-    connection_manager.py   App subscriber management
     schemas.py              Pydantic message models
-    image_codec.py          Base64 JPEG decoder
-    inference/
-      detector.py           Detector interface and YOLO implementation
-      fusion.py             Distance estimation hook
+    algorithms/
+      catalog.py            Loads algorithm_id -> image/io mapping
+      runner.py             Docker command runner
+      service.py            Prepares input/output dirs and reads results
+    video/
+      processor.py          Frame decoding, preprocessing, JPEG encoding
+      registry.py           Video stream registry and status
+    inference/              Legacy in-process detector used by old websocket path
   scripts/
-    send_test_frame.py      Sends one local image through the edge WebSocket
-  tests/
-    test_protocol.py        Lightweight schema checks
-  .env.example
-  requirements.txt
+    register_video_stream.py
+    run_algorithm.py
 ```
 
-## Environment Commands To Run
-
-Run these in WSL2 Ubuntu or a Linux server:
+## Setup
 
 ```bash
 cd /path/to/JetCarCloud
@@ -51,135 +39,143 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-If you already have a YOLOv5 or YOLOv8 weight file, edit `.env`:
-
-```bash
-YOLO_BACKEND=yolov5
-YOLO_MODEL_PATH=/path/to/yolov5s.pt
-YOLOV5_REPO_PATH=/path/to/yolov5-7.0
-YOLO_DEVICE=cpu
-```
-
-For YOLOv8/Ultralytics-format weights, use:
-
-```bash
-YOLO_BACKEND=ultralytics
-YOLO_MODEL_PATH=/path/to/best.pt
-YOLO_DEVICE=cpu
-```
-
-If model loading fails, the service now falls back to OpenCV feature similarity
-instead of failing to start. Check `/health` for `detector` and
-`detector_reason`.
-
-Start the service:
+Start:
 
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Health check:
+Health:
 
 ```bash
 curl http://127.0.0.1:8000/health
 ```
 
-If this service is running inside WSL2 and Jetson/App need to access it through
-the Windows host IP, run PowerShell as Administrator on Windows:
+## Algorithm Catalog
 
-```powershell
-netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=localhost connectport=8000
-New-NetFirewallRule -DisplayName "JetCarCloud 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
-```
-
-## WebSocket Endpoints
-
-Jetson edge upload:
-
-```text
-ws://{cloud-host}:8000/ws/inference/{car_id}/edge
-```
-
-Flutter app result subscription:
-
-```text
-ws://{cloud-host}:8000/ws/inference/{car_id}/app
-```
-
-The edge connection sends an `edge_frame` JSON message. The service replies to
-that edge connection and broadcasts the same `yolo_fusion` result to all app
-subscribers for that `car_id`.
-
-## Test One Image
-
-After the server starts, send a local image:
-
-```bash
-python scripts/send_test_frame.py \
-  --url ws://127.0.0.1:8000/ws/inference/car_001/edge \
-  --image /path/to/test.jpg
-```
-
-## Similarity Workflow
-
-1. Start JetCarEdge mock camera server.
-2. Start JetCarCloud with `EDGE_FRAME_URL` pointing to that server.
-3. In the mobile app, open the third tab, choose a gallery image, and upload it
-   for comparison.
-
-Mock edge camera:
-
-```bash
-cd /path/to/JetCarEdge
-python scripts/mock_camera_server.py \
-  --host 0.0.0.0 \
-  --port 8100 \
-  --image ../yolov5-7.0/data/images/bus.jpg
-```
-
-Cloud:
-
-```bash
-EDGE_FRAME_URL=http://127.0.0.1:8100/api/frame \
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-If the edge mock camera runs on another machine, replace `127.0.0.1` with that
-machine's LAN IP. The older `POST /api/edge/reference` flow still works, but
-`EDGE_FRAME_URL` is closer to the future video-frame design: the app triggers a
-comparison, and the cloud fetches the current frame from the car side.
-
-HTTP APIs:
-
-```text
-POST /api/edge/reference
-POST /api/app/compare
-```
-
-Both accept this JSON shape:
+`algorithms.json` is intentionally empty by default:
 
 ```json
 {
-  "car_id": "car_001",
-  "image": {
-    "encoding": "jpeg",
-    "width": 640,
-    "height": 480,
-    "data": "base64-jpeg"
+  "algorithms": {}
+}
+```
+
+Add model containers by copying entries from `algorithms.example.json`:
+
+```json
+{
+  "algorithms": {
+    "road-inspection": {
+      "name": "Road Inspection",
+      "runner": "docker",
+      "image": "jetcar-road-inspection:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 90,
+      "enabled": true,
+      "metadata": {
+        "task": "run multiple road inspection models in one container"
+      }
+    }
   }
 }
 ```
 
-The comparison response includes `similarity`, `matched`, `threshold`,
-`server_latency_ms`, `reference_source`, and a YOLO label summary. If no
-`YOLO_MODEL_PATH` is set, the service still runs OpenCV feature cosine
-similarity and reports YOLO as unavailable.
+Reload after editing:
 
-## Video Stream Foundation
+```bash
+curl -X POST http://127.0.0.1:8000/api/algorithms/reload
+```
 
-Cloud now has a basic video-stream layer for future camera and AI features. The
-car can later expose RTSP, HTTP MJPEG, or another URL readable by the cloud
-process. For now, register a stream with assumed parameters:
+List algorithms:
+
+```bash
+curl http://127.0.0.1:8000/api/algorithms
+```
+
+## Container Contract
+
+Cloud runs containers like this:
+
+```bash
+docker run --rm \
+  -v "/host/run/input:/app/data/input" \
+  -v "/host/run/output:/app/data/output" \
+  your-image:v1
+```
+
+Each algorithm container should read:
+
+```text
+/app/data/input/frame.jpg
+/app/data/input/request.json
+```
+
+And should write:
+
+```text
+/app/data/output/result.json
+/app/data/output/annotated.jpg        optional
+```
+
+`request.json` contains:
+
+```json
+{
+  "algorithm_id": "road-inspection",
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "parameters": {},
+  "input_dir": "/app/data/input",
+  "output_dir": "/app/data/output"
+}
+```
+
+`result.json` can use any algorithm-specific JSON shape. JetCarCloud returns it
+under the `result` field without interpreting it.
+
+## Run an Algorithm on an Uploaded Image
+
+```bash
+python scripts/run_algorithm.py \
+  --cloud http://127.0.0.1:8000 \
+  --algorithm-id road-inspection \
+  --image /path/to/road-test.jpg \
+  --include-image
+```
+
+API:
+
+```text
+POST /api/algorithms/{algorithm_id}/run
+```
+
+The response is:
+
+```json
+{
+  "type": "algorithm_result",
+  "ok": true,
+  "algorithm_id": "road-inspection",
+  "car_id": "car_001",
+  "stream_id": "upload",
+  "runner": "docker",
+  "latency_ms": 1234.5,
+  "result": {},
+  "outputs": {},
+  "annotated_image": null,
+  "error": ""
+}
+```
+
+If `--include-image` is set and the container writes `annotated.jpg`,
+`annotated_image` contains a base64 JPEG `ImagePayload` that the mobile app can
+display directly.
+
+## Run an Algorithm on a Video Stream Frame
+
+Register a stream:
 
 ```bash
 python scripts/register_video_stream.py \
@@ -192,129 +188,54 @@ python scripts/register_video_stream.py \
   --height 640
 ```
 
-Useful endpoints:
-
-```text
-POST /api/video/streams
-GET  /api/video/streams
-POST /api/video/streams/{car_id}/{stream_id}/preprocess
-POST /api/video/streams/{car_id}/{stream_id}/tasks/yolo_detection/run-once
-POST /api/video/streams/{car_id}/{stream_id}/start
-POST /api/video/streams/{car_id}/{stream_id}/stop
-POST /api/video/chunks/preprocess
-GET  /api/ai/tasks
-POST /api/ai/tasks
-```
-
-The preprocessing step reads one frame through OpenCV, letterboxes it to the
-configured size, returns a JPEG payload, and reports original/resized metadata.
-The default `yolo_detection` task runs the current configured detector. Extra AI
-features can be registered as task specs with their own model path or future
-Docker command metadata; only in-process YOLO execution is enabled right now.
-
-## Manhole Detection Feature
-
-The manhole feature is implemented as a separate feature module on top of the
-shared video layer. The default provider is the local YOLOv5 `.pt` model because
-it works offline, has lower latency, and does not send camera frames to an
-external service. Roboflow can still be enabled as a fallback or comparison
-provider.
-
-Local YOLOv5 configuration:
+Run one frame:
 
 ```bash
-MANHOLE_PROVIDER=local
-MANHOLE_MODEL_PATH=/home/orangelxl/jetson/models/manhole.pt
-MANHOLE_BACKEND=yolov5
-MANHOLE_YOLOV5_REPO_PATH=/home/orangelxl/jetson/yolov5-7.0
-MANHOLE_DEVICE=cpu
-MANHOLE_CONFIDENCE=0.25
-MANHOLE_POSITIVE_LABELS=manhole,manhole-cover,cover
-```
-
-Roboflow configuration:
-
-```bash
-MANHOLE_PROVIDER=roboflow
-ROBOFLOW_API_KEY=your-api-key
-ROBOFLOW_MODEL_ID=manhole-wsmwd
-ROBOFLOW_MODEL_VERSION=1
-```
-
-HTTP APIs:
-
-```text
-POST /api/features/manhole/detect
-POST /api/video/streams/{car_id}/{stream_id}/features/manhole/run-once
-```
-
-Test an image:
-
-```bash
-python scripts/detect_manhole.py \
+python scripts/run_algorithm.py \
   --cloud http://127.0.0.1:8000 \
-  --car-id car_001 \
-  --image /path/to/manhole-test.jpg
-```
-
-Test one frame from a registered stream:
-
-```bash
-python scripts/detect_manhole.py \
-  --cloud http://127.0.0.1:8000 \
-  --car-id car_001 \
-  --stream-id camera_front \
-  --stream
-```
-
-## Road Defect and Combined Road Inspection
-
-Road defect detection is a separate feature that uses a YOLOv8/Ultralytics
-model. Point `ROAD_DEFECT_MODEL_PATH` to your `YOLOv8_Small_2nd_Model.pt` file:
-
-```bash
-ROAD_DEFECT_MODEL_PATH=/home/orangelxl/jetson/models/YOLOv8_Small_2nd_Model.pt
-ROAD_DEFECT_BACKEND=ultralytics
-ROAD_DEFECT_DEVICE=cpu
-ROAD_DEFECT_CONFIDENCE=0.25
-ROAD_DEFECT_POSITIVE_LABELS=
-```
-
-APIs:
-
-```text
-POST /api/features/road-defect/detect
-POST /api/video/streams/{car_id}/{stream_id}/features/road-defect/run-once
-POST /api/features/road-inspection/detect
-POST /api/video/streams/{car_id}/{stream_id}/features/road-inspection/run-once
-```
-
-`road-inspection` runs both manhole detection and road-defect detection on the
-same frame. Add `include_image=true` to return an annotated JPEG payload for the
-mobile app. For upload APIs, put `"include_image": true` in the JSON body. For
-stream APIs, use the query string.
-
-Unified test script:
-
-```bash
-python scripts/detect_road_feature.py \
-  --cloud http://127.0.0.1:8000 \
-  --feature road-inspection \
-  --image /path/to/road-test.jpg \
-  --include-image
-```
-
-Stream example:
-
-```bash
-python scripts/detect_road_feature.py \
-  --cloud http://127.0.0.1:8000 \
-  --feature road-inspection \
+  --algorithm-id road-inspection \
   --car-id car_001 \
   --stream-id camera_front \
   --stream \
   --include-image
 ```
 
-The returned `annotated_image` field is the processed frame encoded as a base64
-JPEG using the same `ImagePayload` shape as other image APIs.
+API:
+
+```text
+POST /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/run-once
+```
+
+## Video Stream Background Mode
+
+Start/stop stream sampling:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/video/streams/car_001/camera_front/start
+curl -X POST http://127.0.0.1:8000/api/video/streams/car_001/camera_front/stop
+```
+
+By default this only publishes `video_frame` metadata. To run algorithms in the
+background, include algorithm IDs in the stream metadata when registering it:
+
+```json
+{
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "url": "rtsp://192.168.10.50:8554/camera",
+  "transport": "rtsp",
+  "metadata": {
+    "algorithms": ["road-inspection"]
+  }
+}
+```
+
+## Windows WSL Port Forwarding
+
+If the service runs inside WSL2 and the phone needs to access it through the
+Windows host IP, run PowerShell as Administrator:
+
+```powershell
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=8000 connectaddress=localhost connectport=8000
+New-NetFirewallRule -DisplayName "JetCarCloud 8000" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow
+```

@@ -1,0 +1,40 @@
+{
+  "algorithms": {
+    "manhole-detection": {
+      "name": "Manhole Detection",
+      "runner": "docker",
+      "image": "jetcar-manhole:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {
+        "task": "detect manholes from one road frame"
+      }
+    },
+    "road-defect-detection": {
+      "name": "Road Defect Detection",
+      "runner": "docker",
+      "image": "jetcar-road-defect:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 60,
+      "enabled": true,
+      "metadata": {
+        "task": "detect pavement cracks, potholes, and surface defects"
+      }
+    },
+    "road-inspection": {
+      "name": "Road Inspection",
+      "runner": "docker",
+      "image": "jetcar-road-inspection:v1",
+      "inputs": ["frame.jpg", "request.json"],
+      "outputs": ["result.json", "annotated.jpg"],
+      "timeout_seconds": 90,
+      "enabled": true,
+      "metadata": {
+        "task": "run multiple road inspection models in one container"
+      }
+    }
+  }
+}

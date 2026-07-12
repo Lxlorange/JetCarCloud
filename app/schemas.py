@@ -40,10 +40,6 @@ class ImageUpload(BaseModel):
     image: ImagePayload
 
 
-class FeatureImageUpload(ImageUpload):
-    include_image: bool = False
-
-
 class ReferenceUploadResult(BaseModel):
     ok: bool = True
     car_id: str
@@ -117,65 +113,35 @@ class VideoChunkUpload(BaseModel):
     frame_index: int = Field(default=0, ge=0)
 
 
-class AiTaskSpec(BaseModel):
-    task_id: str = Field(min_length=1)
-    kind: Literal["yolo", "docker", "custom"] = "yolo"
-    model_path: str = ""
-    backend: str = "auto"
-    docker_image: str = ""
-    docker_command: list[str] = Field(default_factory=list)
+class AlgorithmRunRequest(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="upload", min_length=1)
+    image: ImagePayload | None = None
+    include_image: bool = False
+    parameters: dict = Field(default_factory=dict)
+
+
+class AlgorithmInfo(BaseModel):
+    algorithm_id: str
+    name: str = ""
+    runner: Literal["docker"] = "docker"
+    image: str = ""
+    inputs: list[str] = Field(default_factory=list)
+    outputs: list[str] = Field(default_factory=list)
+    timeout_seconds: int = Field(default=60, ge=1)
     enabled: bool = True
     metadata: dict = Field(default_factory=dict)
 
 
-class AiTaskResult(BaseModel):
-    type: Literal["ai_task_result"] = "ai_task_result"
+class AlgorithmRunResult(BaseModel):
+    type: Literal["algorithm_result"] = "algorithm_result"
     ok: bool = True
-    task_id: str
-    car_id: str
-    stream_id: str = "camera_front"
-    latency_ms: float
-    detections: list[Detection] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-
-
-class ManholeDetectionResult(BaseModel):
-    type: Literal["manhole_detection"] = "manhole_detection"
-    ok: bool = True
+    algorithm_id: str
     car_id: str = "car_001"
-    stream_id: str = "camera_front"
-    provider: Literal["local", "roboflow", "none"] = "none"
-    found: bool = False
-    count: int = 0
+    stream_id: str = "upload"
+    runner: str = "docker"
     latency_ms: float = 0.0
-    detections: list[Detection] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
+    result: dict = Field(default_factory=dict)
+    outputs: dict = Field(default_factory=dict)
+    annotated_image: ImagePayload | None = None
     error: str = ""
-    annotated_image: ImagePayload | None = None
-
-
-class RoadDefectDetectionResult(BaseModel):
-    type: Literal["road_defect_detection"] = "road_defect_detection"
-    ok: bool = True
-    car_id: str = "car_001"
-    stream_id: str = "camera_front"
-    provider: Literal["local", "none"] = "none"
-    found: bool = False
-    count: int = 0
-    latency_ms: float = 0.0
-    detections: list[Detection] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-    error: str = ""
-    annotated_image: ImagePayload | None = None
-
-
-class RoadInspectionResult(BaseModel):
-    type: Literal["road_inspection"] = "road_inspection"
-    ok: bool = True
-    car_id: str = "car_001"
-    stream_id: str = "camera_front"
-    latency_ms: float = 0.0
-    manhole: ManholeDetectionResult
-    road_defect: RoadDefectDetectionResult
-    metadata: dict = Field(default_factory=dict)
-    annotated_image: ImagePayload | None = None

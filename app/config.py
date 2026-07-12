@@ -22,24 +22,9 @@ class Settings(BaseSettings):
     video_default_height: int = Field(default=640, ge=64)
     video_default_fps: float = Field(default=2.0, ge=0.1, le=30.0)
     video_capture_timeout_ms: int = Field(default=5000, ge=100)
-    manhole_provider: str = "local"
-    manhole_model_path: str = ""
-    manhole_backend: str = "yolov5"
-    manhole_yolov5_repo_path: str = ""
-    manhole_device: str = "cpu"
-    manhole_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
-    manhole_image_size: int = Field(default=640, ge=64)
-    manhole_positive_labels: str = "manhole,manhole-cover,cover"
-    roboflow_api_key: str = ""
-    roboflow_model_id: str = "manhole-wsmwd"
-    roboflow_model_version: str = "1"
-    roboflow_api_url: str = ""
-    road_defect_model_path: str = ""
-    road_defect_backend: str = "ultralytics"
-    road_defect_device: str = "cpu"
-    road_defect_confidence: float = Field(default=0.25, ge=0.0, le=1.0)
-    road_defect_image_size: int = Field(default=640, ge=64)
-    road_defect_positive_labels: str = ""
+    algorithm_catalog_path: str = "algorithms.json"
+    algorithm_work_dir: str = ".jetcar_algorithm_runs"
+    docker_executable: str = "docker"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

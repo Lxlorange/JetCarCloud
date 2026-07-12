@@ -3,13 +3,11 @@ from __future__ import annotations
 import numpy as np
 
 from app.schemas import (
-    AiTaskResult,
+    AlgorithmInfo,
+    AlgorithmRunResult,
     Detection,
     EdgeFrame,
     InferenceResult,
-    ManholeDetectionResult,
-    RoadDefectDetectionResult,
-    RoadInspectionResult,
     VideoStreamConfig,
 )
 from app.video import encode_jpeg_payload, preprocess_frame
@@ -69,47 +67,23 @@ def test_video_frame_preprocess_letterboxes_to_target_size() -> None:
     assert payload.height == 640
 
 
-def test_ai_task_result_has_message_type() -> None:
-    result = AiTaskResult(task_id="yolo_detection", car_id="car_001", latency_ms=1.0)
-    assert result.model_dump()["type"] == "ai_task_result"
+def test_algorithm_info_schema() -> None:
+    info = AlgorithmInfo(
+        algorithm_id="road-inspection",
+        runner="docker",
+        image="jetcar-road-inspection:v1",
+        inputs=["frame.jpg", "request.json"],
+        outputs=["result.json", "annotated.jpg"],
+    )
+    assert info.algorithm_id == "road-inspection"
+    assert info.runner == "docker"
 
 
-def test_manhole_detection_result_schema() -> None:
-    result = ManholeDetectionResult(
+def test_algorithm_run_result_schema() -> None:
+    result = AlgorithmRunResult(
+        algorithm_id="road-inspection",
         car_id="car_001",
         stream_id="camera_front",
-        provider="local",
-        found=True,
-        count=1,
-        detections=[Detection(label="manhole", confidence=0.8, bbox=[1, 2, 3, 4])],
+        result={"detections": []},
     )
-    data = result.model_dump()
-    assert data["type"] == "manhole_detection"
-    assert data["found"] is True
-    assert data["count"] == 1
-
-
-def test_road_defect_detection_result_schema() -> None:
-    result = RoadDefectDetectionResult(
-        car_id="car_001",
-        stream_id="camera_front",
-        provider="local",
-        found=True,
-        count=1,
-        detections=[Detection(label="crack", confidence=0.8, bbox=[1, 2, 3, 4])],
-    )
-    data = result.model_dump()
-    assert data["type"] == "road_defect_detection"
-    assert data["found"] is True
-
-
-def test_road_inspection_result_schema() -> None:
-    manhole = ManholeDetectionResult(car_id="car_001", provider="local")
-    road_defect = RoadDefectDetectionResult(car_id="car_001", provider="local")
-    result = RoadInspectionResult(
-        car_id="car_001",
-        stream_id="camera_front",
-        manhole=manhole,
-        road_defect=road_defect,
-    )
-    assert result.model_dump()["type"] == "road_inspection"
+    assert result.model_dump()["type"] == "algorithm_result"

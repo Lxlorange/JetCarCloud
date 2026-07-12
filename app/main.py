@@ -7,25 +7,19 @@ import requests
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 
-from app.ai_tasks import AiTaskRegistry, run_yolo_task
+from app.algorithms import AlgorithmCatalog, AlgorithmService
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
-from app.features.manhole import ManholeSettings, build_manhole_provider
-from app.features.road_defect import RoadDefectSettings, build_road_defect_provider
-from app.features.road_inspection import inspect_road
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
-    AiTaskResult,
-    AiTaskSpec,
+    AlgorithmInfo,
+    AlgorithmRunRequest,
+    AlgorithmRunResult,
     EdgeFrame,
-    FeatureImageUpload,
     ImageUpload,
     InferenceResult,
-    ManholeDetectionResult,
     ReferenceUploadResult,
-    RoadDefectDetectionResult,
-    RoadInspectionResult,
     SimilarityResult,
     VideoChunkUpload,
     VideoFramePreprocessResult,
@@ -50,80 +44,16 @@ detector = build_detector(
     confidence=settings.yolo_confidence,
     image_size=settings.yolo_image_size,
 )
-manhole_provider = build_manhole_provider(
-    ManholeSettings(
-        provider=settings.manhole_provider,
-        model_path=settings.manhole_model_path,
-        backend=settings.manhole_backend,
-        yolov5_repo_path=settings.manhole_yolov5_repo_path,
-        device=settings.manhole_device,
-        confidence=settings.manhole_confidence,
-        image_size=settings.manhole_image_size,
-        positive_labels={
-            label.strip().lower()
-            for label in settings.manhole_positive_labels.split(",")
-            if label.strip()
-        },
-        roboflow_api_key=settings.roboflow_api_key,
-        roboflow_model_id=settings.roboflow_model_id,
-        roboflow_model_version=settings.roboflow_model_version,
-        roboflow_api_url=settings.roboflow_api_url,
-    )
-)
-road_defect_provider = build_road_defect_provider(
-    RoadDefectSettings(
-        model_path=settings.road_defect_model_path,
-        backend=settings.road_defect_backend,
-        device=settings.road_defect_device,
-        confidence=settings.road_defect_confidence,
-        image_size=settings.road_defect_image_size,
-        positive_labels={
-            label.strip().lower()
-            for label in settings.road_defect_positive_labels.split(",")
-            if label.strip()
-        },
-    )
+algorithm_service = AlgorithmService(
+    catalog=AlgorithmCatalog(settings.algorithm_catalog_path),
+    work_dir=settings.algorithm_work_dir,
+    docker_executable=settings.docker_executable,
 )
 
 app = FastAPI(title=settings.app_name)
 reference_images = {}
 video_streams = VideoStreamRegistry()
-ai_tasks = AiTaskRegistry()
 stream_workers: dict[tuple[str, str], asyncio.Task] = {}
-ai_tasks.register(
-    AiTaskSpec(
-        task_id="yolo_detection",
-        kind="yolo",
-        model_path=settings.yolo_model_path,
-        backend=settings.yolo_backend,
-        metadata={"detector": detector.__class__.__name__},
-    )
-)
-ai_tasks.register(
-    AiTaskSpec(
-        task_id="road_defect_detection",
-        kind="custom",
-        model_path=settings.road_defect_model_path,
-        backend=settings.road_defect_backend,
-        metadata={"provider": road_defect_provider.name},
-    )
-)
-ai_tasks.register(
-    AiTaskSpec(
-        task_id="road_inspection",
-        kind="custom",
-        metadata={"features": ["manhole_detection", "road_defect_detection"]},
-    )
-)
-ai_tasks.register(
-    AiTaskSpec(
-        task_id="manhole_detection",
-        kind="custom",
-        model_path=settings.manhole_model_path,
-        backend=settings.manhole_backend,
-        metadata={"provider": manhole_provider.name},
-    )
-)
 
 
 @app.get("/health")
@@ -136,9 +66,7 @@ async def health() -> dict:
         "connections": await manager.stats(),
         "edge_frame_url": settings.edge_frame_url,
         "video_streams": len(video_streams.list()),
-        "ai_tasks": [task.task_id for task in ai_tasks.list()],
-        "manhole_provider": manhole_provider.name,
-        "road_defect_provider": road_defect_provider.name,
+        "algorithms": [item.algorithm_id for item in algorithm_service.catalog.list()],
     }
 
 
@@ -325,166 +253,57 @@ async def preprocess_video_chunk(payload: VideoChunkUpload) -> VideoFramePreproc
     )
 
 
-@app.post("/api/video/streams/{car_id}/{stream_id}/tasks/{task_id}/run-once", response_model=AiTaskResult)
-async def run_stream_task_once(car_id: str, stream_id: str, task_id: str) -> AiTaskResult:
-    runtime = video_streams.get(car_id, stream_id)
-    if runtime is None:
-        raise HTTPException(status_code=404, detail="video stream not registered")
+@app.get("/api/algorithms", response_model=list[AlgorithmInfo])
+async def list_algorithms() -> list[AlgorithmInfo]:
+    return algorithm_service.catalog.list()
 
-    task = ai_tasks.get(task_id)
-    if task is None or not task.enabled:
-        raise HTTPException(status_code=404, detail="ai task not registered or disabled")
-    if task.kind != "yolo":
-        raise HTTPException(status_code=501, detail="only yolo tasks are executable in-process for now")
 
-    config = runtime.config
+@app.post("/api/algorithms/reload", response_model=list[AlgorithmInfo])
+async def reload_algorithms() -> list[AlgorithmInfo]:
+    return algorithm_service.catalog.reload()
+
+
+@app.post("/api/algorithms/{algorithm_id}/run", response_model=AlgorithmRunResult)
+async def run_algorithm(algorithm_id: str, payload: AlgorithmRunRequest) -> AlgorithmRunResult:
+    if payload.image is None:
+        raise HTTPException(status_code=400, detail="image is required")
     try:
-        frame = open_stream_frame(
-            config.url,
-            width=config.width,
-            height=config.height,
-            timeout_ms=settings.video_capture_timeout_ms,
-            source=f"{config.transport}:{config.stream_id}",
+        image = decode_jpeg(payload.image)
+        return algorithm_service.run_image(
+            algorithm_id=algorithm_id,
+            image=image,
+            car_id=payload.car_id,
+            stream_id=payload.stream_id,
+            parameters=payload.parameters,
+            include_image=payload.include_image,
         )
-        video_streams.mark_frame(car_id, stream_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
-        video_streams.mark_error(car_id, stream_id, str(exc))
-        raise HTTPException(status_code=502, detail=f"failed to read stream frame: {exc}") from exc
-
-    return run_yolo_task(
-        task_id=task.task_id,
-        detector=detector,
-        image=frame.image,
-        car_id=car_id,
-        stream_id=stream_id,
-        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-    )
+        raise HTTPException(status_code=500, detail=f"algorithm run failed: {exc}") from exc
 
 
-@app.post("/api/ai/tasks", response_model=AiTaskSpec)
-async def register_ai_task(payload: AiTaskSpec) -> AiTaskSpec:
-    return ai_tasks.register(payload)
-
-
-@app.get("/api/ai/tasks", response_model=list[AiTaskSpec])
-async def list_ai_tasks() -> list[AiTaskSpec]:
-    return ai_tasks.list()
-
-
-@app.post("/api/features/manhole/detect", response_model=ManholeDetectionResult)
-async def detect_manhole_image(payload: FeatureImageUpload) -> ManholeDetectionResult:
-    try:
-        image = decode_jpeg(payload.image)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
-
-    return manhole_provider.detect(
-        image,
-        car_id=payload.car_id,
-        stream_id="upload",
-        metadata={
-            "source": "upload",
-            "image": {
-                "width": payload.image.width,
-                "height": payload.image.height,
-                "encoding": payload.image.encoding,
-            },
-        },
-        include_image=payload.include_image,
-    )
-
-
-@app.post("/api/video/streams/{car_id}/{stream_id}/features/manhole/run-once", response_model=ManholeDetectionResult)
-async def detect_manhole_stream_once(car_id: str, stream_id: str, include_image: bool = False) -> ManholeDetectionResult:
-    frame = _read_registered_stream_frame(car_id, stream_id)
-
-    return manhole_provider.detect(
-        frame.image,
-        car_id=car_id,
-        stream_id=stream_id,
-        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-        include_image=include_image,
-    )
-
-
-@app.post("/api/features/road-defect/detect", response_model=RoadDefectDetectionResult)
-async def detect_road_defect_image(payload: FeatureImageUpload) -> RoadDefectDetectionResult:
-    try:
-        image = decode_jpeg(payload.image)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
-
-    return road_defect_provider.detect(
-        image,
-        car_id=payload.car_id,
-        stream_id="upload",
-        metadata={
-            "source": "upload",
-            "image": {
-                "width": payload.image.width,
-                "height": payload.image.height,
-                "encoding": payload.image.encoding,
-            },
-        },
-        include_image=payload.include_image,
-    )
-
-
-@app.post("/api/video/streams/{car_id}/{stream_id}/features/road-defect/run-once", response_model=RoadDefectDetectionResult)
-async def detect_road_defect_stream_once(
+@app.post("/api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/run-once", response_model=AlgorithmRunResult)
+async def run_stream_algorithm_once(
     car_id: str,
     stream_id: str,
+    algorithm_id: str,
     include_image: bool = False,
-) -> RoadDefectDetectionResult:
+) -> AlgorithmRunResult:
     frame = _read_registered_stream_frame(car_id, stream_id)
-
-    return road_defect_provider.detect(
-        frame.image,
-        car_id=car_id,
-        stream_id=stream_id,
-        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-        include_image=include_image,
-    )
-
-
-@app.post("/api/features/road-inspection/detect", response_model=RoadInspectionResult)
-async def inspect_road_image(payload: FeatureImageUpload) -> RoadInspectionResult:
     try:
-        image = decode_jpeg(payload.image)
+        return algorithm_service.run_image(
+            algorithm_id=algorithm_id,
+            image=frame.image,
+            car_id=car_id,
+            stream_id=stream_id,
+            parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+            include_image=include_image,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"invalid image payload: {exc}") from exc
-
-    return inspect_road(
-        image,
-        car_id=payload.car_id,
-        stream_id="upload",
-        manhole_provider=manhole_provider,
-        road_defect_provider=road_defect_provider,
-        metadata={
-            "source": "upload",
-            "image": {
-                "width": payload.image.width,
-                "height": payload.image.height,
-                "encoding": payload.image.encoding,
-            },
-        },
-        include_image=payload.include_image,
-    )
-
-
-@app.post("/api/video/streams/{car_id}/{stream_id}/features/road-inspection/run-once", response_model=RoadInspectionResult)
-async def inspect_road_stream_once(car_id: str, stream_id: str, include_image: bool = False) -> RoadInspectionResult:
-    frame = _read_registered_stream_frame(car_id, stream_id)
-
-    return inspect_road(
-        frame.image,
-        car_id=car_id,
-        stream_id=stream_id,
-        manhole_provider=manhole_provider,
-        road_defect_provider=road_defect_provider,
-        metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-        include_image=include_image,
-    )
+        raise HTTPException(status_code=500, detail=f"algorithm run failed: {exc}") from exc
 
 
 @app.post("/api/video/streams/{car_id}/{stream_id}/start", response_model=VideoStreamStatus)
@@ -530,32 +349,25 @@ async def _stream_worker(car_id: str, stream_id: str) -> None:
                     source=f"{config.transport}:{config.stream_id}",
                 )
                 video_streams.mark_frame(car_id, stream_id)
-                result = run_yolo_task(
-                    task_id="yolo_detection",
-                    detector=detector,
-                    image=frame.image,
-                    car_id=car_id,
-                    stream_id=stream_id,
-                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-                )
-                await manager.publish(car_id, result.model_dump(mode="json"))
-                manhole_result = manhole_provider.detect(
-                    frame.image,
-                    car_id=car_id,
-                    stream_id=stream_id,
-                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-                )
-                await manager.publish(car_id, manhole_result.model_dump(mode="json"))
-                inspection_result = inspect_road(
-                    frame.image,
-                    car_id=car_id,
-                    stream_id=stream_id,
-                    manhole_provider=manhole_provider,
-                    road_defect_provider=road_defect_provider,
-                    metadata={"preprocess": frame.metadata.model_dump(mode="json")},
-                    include_image=False,
-                )
-                await manager.publish(car_id, inspection_result.model_dump(mode="json"))
+                frame_event = {
+                    "type": "video_frame",
+                    "car_id": car_id,
+                    "stream_id": stream_id,
+                    "metadata": frame.metadata.model_dump(mode="json"),
+                }
+                await manager.publish(car_id, frame_event)
+                algorithm_ids = config.metadata.get("algorithms", [])
+                for algorithm_id in algorithm_ids:
+                    result = await asyncio.to_thread(
+                        algorithm_service.run_image,
+                        algorithm_id=algorithm_id,
+                        image=frame.image,
+                        car_id=car_id,
+                        stream_id=stream_id,
+                        parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+                        include_image=False,
+                    )
+                    await manager.publish(car_id, result.model_dump(mode="json"))
             except Exception as exc:
                 video_streams.mark_error(car_id, stream_id, str(exc))
             await asyncio.sleep(max(0.033, config.sample_interval_ms / 1000.0))
