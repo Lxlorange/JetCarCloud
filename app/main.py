@@ -633,8 +633,6 @@ async def stream_algorithm_mjpeg(
     fps: float = Query(default=1.0, ge=0.1, le=10.0),
     fallback_original: bool = True,
 ) -> StreamingResponse:
-    if video_streams.get(car_id, stream_id) is None:
-        raise HTTPException(status_code=404, detail="video stream not registered")
     try:
         algorithm_service.catalog.require(algorithm_id)
     except KeyError as exc:
@@ -747,8 +745,15 @@ async def _processed_mjpeg_generator(
                 jpeg = cached.image
                 last_timestamp = cached.timestamp
             elif fallback_original:
-                frame = await asyncio.to_thread(_read_registered_stream_frame, car_id, stream_id)
-                jpeg = _encode_jpeg_bytes(frame.image)
+                runtime = video_streams.get(car_id, stream_id)
+                if runtime is not None and runtime.latest_frame is not None:
+                    frame = runtime.latest_frame
+                    jpeg = _encode_jpeg_bytes(frame.image)
+                else:
+                    jpeg = _waiting_frame_jpeg(
+                        f"waiting for {car_id}/{stream_id}",
+                        f"algorithm: {algorithm_id}",
+                    )
             if jpeg is not None:
                 yield (
                     b"--frame\r\n"
@@ -760,7 +765,8 @@ async def _processed_mjpeg_generator(
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            video_streams.mark_error(car_id, stream_id, str(exc))
+            if video_streams.get(car_id, stream_id) is not None:
+                video_streams.mark_error(car_id, stream_id, str(exc))
 
         elapsed = time.perf_counter() - started
         await asyncio.sleep(max(0.0, interval - elapsed))
@@ -1358,6 +1364,18 @@ def _encode_jpeg_bytes(image) -> bytes:
     if not ok:
         raise ValueError("failed to encode jpeg frame")
     return encoded.tobytes()
+
+
+def _waiting_frame_jpeg(line1: str, line2: str = "") -> bytes:
+    import numpy as np
+
+    image = np.full((360, 640, 3), 245, dtype=np.uint8)
+    cv2.putText(image, "JetCarCloud preview", (32, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (40, 40, 40), 2, cv2.LINE_AA)
+    cv2.putText(image, line1[:60], (32, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 80), 2, cv2.LINE_AA)
+    if line2:
+        cv2.putText(image, line2[:60], (32, 198), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (80, 80, 80), 2, cv2.LINE_AA)
+    cv2.putText(image, "no frame received yet", (32, 286), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (20, 110, 180), 2, cv2.LINE_AA)
+    return _encode_jpeg_bytes(image)
 
 
 def _local_lan_ip() -> str:
