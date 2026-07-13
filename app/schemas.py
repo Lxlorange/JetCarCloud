@@ -40,6 +40,18 @@ class ImageUpload(BaseModel):
     image: ImagePayload
 
 
+class SimilaritySearchStartRequest(ImageUpload):
+    stream_id: str = Field(default="camera_front", min_length=1)
+    algorithm_id: str = Field(default="yolov5-similarity", min_length=1)
+    threshold: float = Field(default=0.45, ge=0.0, le=1.0)
+
+
+class SimilaritySearchStopRequest(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="camera_front", min_length=1)
+    algorithm_id: str = Field(default="yolov5-similarity", min_length=1)
+
+
 class ReferenceUploadResult(BaseModel):
     ok: bool = True
     car_id: str

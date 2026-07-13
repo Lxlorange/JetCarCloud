@@ -30,6 +30,8 @@ from app.schemas import (
     InferenceResult,
     ReferenceUploadResult,
     SimilarityResult,
+    SimilaritySearchStartRequest,
+    SimilaritySearchStopRequest,
     VideoChunkUpload,
     VideoFrameUploadResult,
     VideoFramePreprocessResult,
@@ -65,6 +67,7 @@ algorithm_service = AlgorithmService(
 
 app = FastAPI(title=settings.app_name)
 reference_images = {}
+similarity_sessions: dict[tuple[str, str, str], dict] = {}
 video_streams = VideoStreamRegistry()
 stream_workers: dict[tuple[str, str], asyncio.Task] = {}
 
@@ -140,6 +143,7 @@ async def dashboard_state() -> dict:
             "algorithm_min_interval_ms": settings.algorithm_min_interval_ms,
             "video_push_min_interval_ms": settings.video_push_min_interval_ms,
         },
+        "similarity_sessions": list(similarity_sessions.values()),
         "processed_frames": _dashboard_processed_frames(now),
         "debug": _dashboard_debug_summary(),
     }
@@ -209,6 +213,69 @@ async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
         yolo_summary=result.yolo_summary,
         reference_source=reference_source,
     )
+
+
+@app.post("/api/similarity/search/start")
+async def start_similarity_search(payload: SimilaritySearchStartRequest) -> dict:
+    image = decode_jpeg(payload.image)
+    session_dir = (
+        Path(settings.algorithm_work_dir)
+        / "similarity_sessions"
+        / _safe_path_part(payload.car_id)
+        / _safe_path_part(payload.stream_id)
+        / _safe_path_part(payload.algorithm_id)
+    )
+    session_dir.mkdir(parents=True, exist_ok=True)
+    template_path = session_dir / "target.jpg"
+    _write_debug_image(template_path, image)
+    session = {
+        "car_id": payload.car_id,
+        "stream_id": payload.stream_id,
+        "algorithm_id": payload.algorithm_id,
+        "threshold": payload.threshold,
+        "template_path": str(template_path),
+        "started_at": time.time(),
+        "active": True,
+    }
+    similarity_sessions[(payload.car_id, payload.stream_id, payload.algorithm_id)] = session
+    logger.info(
+        "similarity search started car_id=%s stream_id=%s algorithm_id=%s template=%s threshold=%.3f",
+        payload.car_id,
+        payload.stream_id,
+        payload.algorithm_id,
+        template_path,
+        payload.threshold,
+    )
+    return {
+        "ok": True,
+        "type": "similarity_search_session",
+        **session,
+        "edge_mask": "similarity",
+        "edge_algorithm_ids": [payload.algorithm_id],
+    }
+
+
+@app.post("/api/similarity/search/stop")
+async def stop_similarity_search(payload: SimilaritySearchStopRequest) -> dict:
+    key = (payload.car_id, payload.stream_id, payload.algorithm_id)
+    removed = similarity_sessions.pop(key, None)
+    logger.info(
+        "similarity search stopped car_id=%s stream_id=%s algorithm_id=%s active_before=%s",
+        payload.car_id,
+        payload.stream_id,
+        payload.algorithm_id,
+        removed is not None,
+    )
+    return {
+        "ok": True,
+        "type": "similarity_search_stopped",
+        "car_id": payload.car_id,
+        "stream_id": payload.stream_id,
+        "algorithm_id": payload.algorithm_id,
+        "active_before": removed is not None,
+        "edge_mask": "FF",
+        "edge_algorithm_ids": [],
+    }
 
 
 def fetch_edge_frame(url: str):
@@ -410,13 +477,23 @@ async def run_stream_algorithm_once(
     include_image: bool = False,
 ) -> AlgorithmRunResult:
     frame = _read_registered_stream_frame(car_id, stream_id)
+    parameters = {"preprocess": frame.metadata.model_dump(mode="json")}
+    if algorithm_id == "yolov5-similarity":
+        session = similarity_sessions.get((car_id, stream_id, algorithm_id))
+        if session is not None:
+            parameters.update(
+                {
+                    "template_path": session["template_path"],
+                    "threshold": session["threshold"],
+                }
+            )
     try:
         result = algorithm_service.run_image(
             algorithm_id=algorithm_id,
             image=frame.image,
             car_id=car_id,
             stream_id=stream_id,
-            parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+            parameters=parameters,
             include_image=include_image,
         )
         _cache_processed_frame(car_id, stream_id, algorithm_id, result)
@@ -722,6 +799,19 @@ def _queue_algorithms_for_frame(
     skipped: list[dict] = []
     for algorithm_id in algorithm_ids:
         key = (car_id, stream_id, algorithm_id)
+        parameters = {"preprocess": frame.metadata.model_dump(mode="json")}
+        if algorithm_id == "yolov5-similarity":
+            session = similarity_sessions.get(key)
+            if session is None or not session.get("active"):
+                skipped.append({"algorithm_id": algorithm_id, "reason": "similarity_session_not_started"})
+                continue
+            parameters.update(
+                {
+                    "template_path": session["template_path"],
+                    "threshold": session["threshold"],
+                }
+            )
+
         running = processing_tasks_by_key.get(key)
         if running is not None and not running.done():
             skipped.append({"algorithm_id": algorithm_id, "reason": "algorithm_busy"})
@@ -759,6 +849,7 @@ def _queue_algorithms_for_frame(
                 car_id=car_id,
                 stream_id=stream_id,
                 algorithm_id=algorithm_id,
+                parameters=parameters,
                 include_image=include_image,
             )
         )
@@ -818,6 +909,7 @@ async def _run_algorithm_for_pushed_frame(
     car_id: str,
     stream_id: str,
     algorithm_id: str,
+    parameters: dict,
     include_image: bool,
 ) -> None:
     try:
@@ -827,7 +919,7 @@ async def _run_algorithm_for_pushed_frame(
             image=frame.image,
             car_id=car_id,
             stream_id=stream_id,
-            parameters={"preprocess": frame.metadata.model_dump(mode="json")},
+            parameters=parameters,
             include_image=include_image,
         )
         _cache_processed_frame(car_id, stream_id, algorithm_id, result)

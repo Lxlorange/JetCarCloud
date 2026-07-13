@@ -1,4 +1,4 @@
-# JetCarCloud 接口简表
+# JetCarCloud 接口说明
 
 局域网地址：
 
@@ -7,50 +7,82 @@ HTTP: http://<cloud-ip>:8000
 WS:   ws://<cloud-ip>:8000
 ```
 
-Cloud 跑在 WSL2 时，`<cloud-ip>` 一般填写 Windows 主机的局域网 IP。
+WSL2 运行时，`<cloud-ip>` 通常填写 Windows 主机的局域网 IP。
 
-## 主流程
+## 1. 路面巡检链路
 
-1. 手机连接结果 WebSocket。
-2. 手机打开处理后图像 MJPEG 流。
-3. 小车持续向 Cloud 推送 JPEG 帧。
-4. Cloud 收到帧后按 `algorithm_id` 调用本地 Python runner。
-5. Cloud 把 JSON 识别结果和处理后画面发给手机。
-
-## 小车端接口
-
-HTTP 推送单帧：
+路面巡检由手机端两个开关联动控制：
 
 ```text
-POST /api/video/streams/{car_id}/{stream_id}/frames?algorithm_id={algorithm_id}
-POST /api/video/streams/{car_id}/{stream_id}/frames?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage
+mask[0] = 井盖检测 yolov5-manhole-detect
+mask[1] = 路面缺陷 yolov8-road-damage
 ```
 
-WebSocket 连续推帧：
+示例：
 
 ```text
-WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage
+TF -> 只开井盖检测
+FT -> 只开路面缺陷检测
+TT -> 两个模型都开
+FF -> 全部关闭，Edge 断开 Cloud 推流，Cloud 不再触发算法
 ```
 
-请求体：
+手机端把 mask 发给小车端 Edge 的 AI 控制端口。Edge 根据 mask 更新它连接 Cloud 的 WebSocket：
+
+```text
+WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov5-manhole-detect&include_image=true
+WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov8-road-damage&include_image=true
+WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage&include_image=true
+```
+
+Edge 发给 Cloud 的每帧 JSON：
 
 ```json
 {
   "car_id": "car_001",
   "image": {
     "encoding": "jpeg",
-    "width": 1280,
-    "height": 720,
+    "width": 640,
+    "height": 480,
     "data": "base64-encoded-jpeg"
   }
 }
 ```
 
-响应里 `frame_accepted=false` 表示输入帧率过高，本帧被限流丢弃；`algorithms_skipped` 表示模型忙或算法限速。
+Cloud 会按 `VIDEO_PUSH_MIN_INTERVAL_MS`、`ALGORITHM_MIN_INTERVAL_MS` 和
+`ALGORITHM_MAX_CONCURRENT_TASKS` 限流。结果通过手机端结果 WebSocket 返回。
 
-## 手机端接口
+## 2. Edge AI 控制端口
 
-接收识别结果：
+JetCarEdge 额外提供一个轻量 TCP 控制端口，默认：
+
+```text
+tcp://<edge-ip>:6001
+```
+
+每条消息是一行 JSON，Edge 返回一行 JSON。路面巡检示例：
+
+```json
+{"type":"jetcar_ai_control","mode":"road_inspection","car_id":"car_001","stream_id":"camera_front","mask":"TF"}
+```
+
+关闭所有 AI：
+
+```json
+{"type":"jetcar_ai_control","mode":"off","car_id":"car_001","stream_id":"camera_front","mask":"FF","algorithm_ids":[]}
+```
+
+相似度寻物：
+
+```json
+{"type":"jetcar_ai_control","mode":"similarity","car_id":"car_001","stream_id":"camera_front","algorithm_ids":["yolov5-similarity"]}
+```
+
+Edge 收到空算法列表或 `FF` 时应停止上传并断开 Cloud WebSocket，用于省电和避免无意义推理。
+
+## 3. 手机端结果通道
+
+手机端连接：
 
 ```text
 WS /ws/inference/{car_id}/app
@@ -67,7 +99,10 @@ WS /ws/inference/{car_id}/app
   "stream_id": "camera_front",
   "runner": "local",
   "latency_ms": 1234.5,
-  "result": {},
+  "result": {
+    "detection_count": 1,
+    "detections": []
+  },
   "annotated_image": null,
   "error": ""
 }
@@ -79,15 +114,96 @@ WS /ws/inference/{car_id}/app
 GET /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg?fps=5
 ```
 
-返回：
+该接口只输出最新缓存的处理后画面，不主动触发算法。算法由 Edge 推帧触发。
+
+## 4. 相似度寻物链路
+
+相似度寻物和路面巡检是独立逻辑：
+
+1. 手机端上传目标图片到 Cloud。
+2. Cloud 保存本次寻物会话的目标图。
+3. 手机端通知 Edge 开启 `yolov5-similarity`。
+4. Edge 持续推摄像头帧到 Cloud。
+5. Cloud 用每帧和目标图做相似度判断。
+6. 一旦 `matched=true`，手机端结束任务，并通知 Edge/Cloud 停止。
+
+启动会话：
 
 ```text
-multipart/x-mixed-replace; boundary=frame
+POST /api/similarity/search/start
 ```
 
-该接口只输出最新处理后画面，不主动触发算法；算法由小车推帧或后台采样触发。
+请求：
 
-## 算法管理
+```json
+{
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "algorithm_id": "yolov5-similarity",
+  "threshold": 0.45,
+  "image": {
+    "encoding": "jpeg",
+    "width": 1280,
+    "height": 720,
+    "data": "base64-encoded-jpeg"
+  }
+}
+```
+
+响应：
+
+```json
+{
+  "ok": true,
+  "type": "similarity_search_session",
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "algorithm_id": "yolov5-similarity",
+  "threshold": 0.45,
+  "template_path": ".jetcar_algorithm_runs/similarity_sessions/car_001/camera_front/yolov5-similarity/target.jpg",
+  "active": true,
+  "edge_mask": "similarity",
+  "edge_algorithm_ids": ["yolov5-similarity"]
+}
+```
+
+停止会话：
+
+```text
+POST /api/similarity/search/stop
+```
+
+请求：
+
+```json
+{
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "algorithm_id": "yolov5-similarity"
+}
+```
+
+相似度结果示例：
+
+```json
+{
+  "type": "algorithm_result",
+  "ok": true,
+  "algorithm_id": "yolov5-similarity",
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "result": {
+    "task": "similarity",
+    "matched": true,
+    "similarity": 0.72,
+    "threshold": 0.45
+  }
+}
+```
+
+如果 Edge 在没有启动相似度会话时请求 `yolov5-similarity`，Cloud 会跳过该算法，避免拿旧模板误判。
+
+## 5. 算法管理
 
 查看算法：
 
@@ -109,33 +225,17 @@ yolov5-manhole-detect
 yolov8-road-damage
 ```
 
-算法配置示例：
+## 6. 调试页面
 
-```json
-{
-  "algorithms": {
-    "yolov8-road-damage": {
-      "name": "YOLOv8 Road Damage Detection",
-      "runner": "local",
-      "image": "",
-      "inputs": ["frame.jpg", "request.json"],
-      "outputs": ["result.json", "annotated.jpg"],
-      "timeout_seconds": 60,
-      "enabled": true,
-      "metadata": {
-        "task": "road_damage_detection",
-        "model_path": "models/yolov8-road-damage/YOLOv8_Small_2nd_Model.pt",
-        "imgsz": 640,
-        "conf": 0.2,
-        "iou": 0.45,
-        "device": "cpu"
-      }
-    }
-  }
-}
+```text
+GET /dashboard
+GET /unicorn
+GET /api/dashboard/state
 ```
 
-## 健康检查
+页面展示视频流、算法表、活跃任务、相似度会话、最近处理结果和 `.jetcar_debug` 目录摘要。
+
+## 7. 健康检查
 
 ```text
 GET /health
