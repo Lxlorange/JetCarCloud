@@ -127,6 +127,15 @@ GET /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg?fps=
 5. Cloud 用每帧和目标图做相似度判断。
 6. 一旦 `matched=true`，手机端结束任务，并通知 Edge/Cloud 停止。
 
+Edge 端也可以同时连接手机端结果通道：
+
+```text
+WS /ws/inference/{car_id}/app
+```
+
+这样 Edge 不需要等待上传 WebSocket 的逐帧响应，而是直接接收 Cloud 广播的
+`algorithm_result`，并在本地做运动闭环和安全停止。
+
 启动会话：
 
 ```text
@@ -240,3 +249,95 @@ GET /api/dashboard/state
 ```text
 GET /health
 ```
+
+## 8. Cloud IP 自动发现
+
+Cloud 可以向局域网广播自己的 HTTP 地址，Edge 启动时可以监听该广播并自动设置 `cloud_host`。默认关闭，避免多网卡环境误选。
+
+Cloud `.env` 示例：
+
+```text
+DISCOVERY_BEACON_ENABLED=true
+DISCOVERY_BEACON_PORT=8765
+DISCOVERY_BEACON_INTERVAL_SECONDS=1.0
+DISCOVERY_BEACON_HOST=
+```
+
+`DISCOVERY_BEACON_HOST` 为空时 Cloud 会尝试自动取本机局域网 IP。WSL2 下如果自动取到的是 WSL 内部地址，可以手动填 Windows 主机局域网 IP。
+
+Edge 参数：
+
+```text
+cloud_discovery_enabled: true
+cloud_discovery_port: 8765
+cloud_discovery_listen_seconds: 2.0
+```
+
+如果 Edge 在超时时间内没有收到 beacon，会继续使用配置文件里的 `cloud_host`。
+
+## 9. 网页调试 Edge 控制
+
+`/dashboard` 和 `/unicorn` 增加了 Similarity Search 面板，可完成：
+
+- 上传目标图片并调用 `POST /api/similarity/search/start`
+- 停止相似度 session
+- 向 Edge TCP 控制口发送启动/停止 JSON
+- 查看 similarity session、最新算法结果、处理后 MJPEG 画面和 debug dump
+
+Cloud 转发 Edge 控制命令：
+
+```text
+POST /api/debug/edge-control
+```
+
+请求：
+
+```json
+{
+  "edge_host": "192.168.10.50",
+  "edge_port": 6001,
+  "command": {
+    "type": "jetcar_ai_control",
+    "mode": "similarity",
+    "car_id": "car_001",
+    "stream_id": "camera_front",
+    "algorithm_ids": ["yolov5-similarity"]
+  }
+}
+```
+
+停止：
+
+```json
+{
+  "edge_host": "192.168.10.50",
+  "edge_port": 6001,
+  "command": {
+    "type": "jetcar_ai_control",
+    "mode": "stop",
+    "car_id": "car_001",
+    "stream_id": "camera_front",
+    "algorithm_ids": []
+  }
+}
+```
+
+## 10. 相似度寻物运动闭环字段
+
+`yolov5-similarity` 结果会返回目标位置估计：
+
+```json
+{
+  "matched": true,
+  "similarity": 0.72,
+  "threshold": 0.45,
+  "center_norm": [0.48, 0.53],
+  "bbox_norm": [0.30, 0.25, 0.66, 0.75],
+  "localization": {
+    "method": "orb_homography",
+    "matched_keypoints": 18
+  }
+}
+```
+
+Edge 使用 `center_norm[0]` 做左右对准：目标偏左/偏右时先原地转向，居中后才低速靠近。靠近阶段依赖雷达前方距离；如果没有雷达距离，Edge 默认停车等待，避免盲目前进。

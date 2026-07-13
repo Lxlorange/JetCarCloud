@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import logging
+import socket
 import shutil
 import time
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from app.algorithms import AlgorithmCatalog, AlgorithmService
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
 from app.dashboard import DASHBOARD_HTML
+from app.discovery import broadcast_discovery_beacon
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
@@ -26,6 +28,7 @@ from app.schemas import (
     AlgorithmRunRequest,
     AlgorithmRunResult,
     EdgeFrame,
+    EdgeControlProxyRequest,
     ImageUpload,
     InferenceResult,
     ReferenceUploadResult,
@@ -70,6 +73,7 @@ reference_images = {}
 similarity_sessions: dict[tuple[str, str, str], dict] = {}
 video_streams = VideoStreamRegistry()
 stream_workers: dict[tuple[str, str], asyncio.Task] = {}
+discovery_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -86,6 +90,35 @@ algorithm_last_started_at: dict[tuple[str, str, str], float] = {}
 debug_dump_dir = Path(settings.debug_dump_dir)
 
 
+@app.on_event("startup")
+async def startup() -> None:
+    global discovery_task
+    if not settings.discovery_beacon_enabled:
+        return
+    host = settings.discovery_beacon_host.strip() or _local_lan_ip()
+    discovery_task = asyncio.create_task(
+        broadcast_discovery_beacon(
+            service=settings.app_name,
+            host=host,
+            port=settings.discovery_beacon_port,
+            http_port=settings.port,
+            interval_seconds=settings.discovery_beacon_interval_seconds,
+        )
+    )
+    logger.info(
+        "cloud discovery beacon started host=%s http_port=%s udp_port=%s",
+        host,
+        settings.port,
+        settings.discovery_beacon_port,
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    if discovery_task is not None:
+        discovery_task.cancel()
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -97,6 +130,11 @@ async def health() -> dict:
         "edge_frame_url": settings.edge_frame_url,
         "video_streams": len(video_streams.list()),
         "algorithms": [item.algorithm_id for item in algorithm_service.catalog.list()],
+        "discovery": {
+            "enabled": settings.discovery_beacon_enabled,
+            "port": settings.discovery_beacon_port,
+            "host": settings.discovery_beacon_host or _local_lan_ip(),
+        },
     }
 
 
@@ -146,6 +184,11 @@ async def dashboard_state() -> dict:
         "similarity_sessions": list(similarity_sessions.values()),
         "processed_frames": _dashboard_processed_frames(now),
         "debug": _dashboard_debug_summary(),
+        "discovery": {
+            "enabled": settings.discovery_beacon_enabled,
+            "port": settings.discovery_beacon_port,
+            "host": settings.discovery_beacon_host or _local_lan_ip(),
+        },
     }
 
 
@@ -278,6 +321,32 @@ async def stop_similarity_search(payload: SimilaritySearchStopRequest) -> dict:
     }
 
 
+@app.post("/api/debug/edge-control")
+async def proxy_edge_control(payload: EdgeControlProxyRequest) -> dict:
+    command = dict(payload.command)
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    started = time.perf_counter()
+    try:
+        response = await asyncio.to_thread(
+            _send_edge_control_command,
+            payload.edge_host,
+            payload.edge_port,
+            command,
+            payload.timeout_seconds,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"failed to send edge control command: {exc}") from exc
+    return {
+        "ok": True,
+        "edge_host": payload.edge_host,
+        "edge_port": payload.edge_port,
+        "latency_ms": round((time.perf_counter() - started) * 1000.0, 3),
+        "command": command,
+        "response": response,
+    }
+
+
 def fetch_edge_frame(url: str):
     response = requests.get(url, timeout=(3, 10))
     response.raise_for_status()
@@ -294,6 +363,31 @@ def fetch_edge_frame(url: str):
     if image is None:
         raise ValueError(f"edge frame response is not a decodable image: {url}")
     return image
+
+
+def _send_edge_control_command(host: str, port: int, command: dict, timeout_seconds: float) -> dict:
+    message = json.dumps(command, ensure_ascii=False, separators=(",", ":")) + "\n"
+    with socket.create_connection((host, int(port)), timeout=timeout_seconds) as sock:
+        sock.settimeout(timeout_seconds)
+        sock.sendall(message.encode("utf-8"))
+        chunks = []
+        while True:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            if b"\n" in chunk:
+                break
+    raw = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    if not raw:
+        return {"raw": ""}
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError:
+        return {"raw": raw}
+    if isinstance(loaded, dict):
+        return loaded
+    return {"raw": loaded}
 
 
 def _read_registered_stream_frame(car_id: str, stream_id: str):
@@ -1254,6 +1348,15 @@ def _encode_jpeg_bytes(image) -> bytes:
     if not ok:
         raise ValueError("failed to encode jpeg frame")
     return encoded.tobytes()
+
+
+def _local_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return "127.0.0.1"
 
 
 @app.websocket("/ws/inference/{car_id}/edge")

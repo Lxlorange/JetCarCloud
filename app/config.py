@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     debug_save_images: bool = True
     debug_save_algorithm_outputs: bool = True
     debug_dump_skipped_frames: bool = False
+    discovery_beacon_enabled: bool = False
+    discovery_beacon_port: int = Field(default=8765, ge=1, le=65535)
+    discovery_beacon_interval_seconds: float = Field(default=1.0, ge=0.2)
+    discovery_beacon_host: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

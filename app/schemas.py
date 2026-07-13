@@ -52,6 +52,13 @@ class SimilaritySearchStopRequest(BaseModel):
     algorithm_id: str = Field(default="yolov5-similarity", min_length=1)
 
 
+class EdgeControlProxyRequest(BaseModel):
+    edge_host: str = Field(min_length=1)
+    edge_port: int = Field(default=6001, ge=1, le=65535)
+    command: dict = Field(default_factory=dict)
+    timeout_seconds: float = Field(default=3.0, ge=0.2, le=30.0)
+
+
 class ReferenceUploadResult(BaseModel):
     ok: bool = True
     car_id: str

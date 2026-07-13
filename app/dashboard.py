@@ -142,7 +142,7 @@ DASHBOARD_HTML = """
       gap: 8px;
       margin-bottom: 10px;
     }
-    select, button {
+    select, button, input, textarea {
       min-height: 34px;
       border-radius: 6px;
       border: 1px solid var(--line);
@@ -150,12 +150,37 @@ DASHBOARD_HTML = """
       color: var(--text);
       padding: 6px 9px;
       font: inherit;
+      width: 100%;
     }
     button {
       background: var(--accent);
       border-color: var(--accent);
       color: #fff;
       cursor: pointer;
+      width: auto;
+      white-space: nowrap;
+    }
+    button.secondary {
+      background: #fff;
+      border-color: var(--line);
+      color: var(--text);
+    }
+    .form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .form-grid .wide { grid-column: 1 / -1; }
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+    textarea {
+      min-height: 88px;
+      resize: vertical;
     }
     .preview {
       width: 100%;
@@ -250,6 +275,29 @@ DASHBOARD_HTML = """
           <div id="previewInfo" class="sub"></div>
         </div>
         <div class="panel">
+          <h2>Similarity Search</h2>
+          <div class="form-grid">
+            <label>Car ID<input id="simCarId" value="car_001"></label>
+            <label>Stream ID<input id="simStreamId" value="camera_front"></label>
+            <label>Edge Host<input id="edgeHost" placeholder="192.168.10.x"></label>
+            <label>Edge Port<input id="edgePort" type="number" value="6001"></label>
+            <label>Threshold<input id="simThreshold" type="number" step="0.01" min="0" max="1" value="0.45"></label>
+            <label class="wide">Target Image<input id="simImage" type="file" accept="image/*"></label>
+          </div>
+          <div class="actions">
+            <button id="startSimilarity" type="button">Start Search</button>
+            <button id="stopSimilarity" class="secondary" type="button">Stop Search</button>
+            <button id="edgeStart" type="button">Edge Start</button>
+            <button id="edgeStop" class="secondary" type="button">Edge Stop</button>
+          </div>
+          <textarea id="edgeCommand" spellcheck="false"></textarea>
+          <div id="simStatus" class="sub">No command sent</div>
+        </div>
+        <div class="panel">
+          <h2>Similarity Sessions</h2>
+          <div id="sessionsTable"></div>
+        </div>
+        <div class="panel">
           <h2>Debug Dump</h2>
           <div id="debugTable"></div>
         </div>
@@ -322,9 +370,11 @@ DASHBOARD_HTML = """
       renderStreams(streams);
       renderResults(results);
       renderAlgorithms(algorithms);
+      renderSessions(data.similarity_sessions || []);
       renderDebug(data.debug || {});
       renderPreviewOptions(results);
       document.getElementById("rawState").textContent = JSON.stringify(data, null, 2);
+      renderDefaultEdgeCommand();
     }
 
     function renderStreams(streams) {
@@ -386,6 +436,22 @@ DASHBOARD_HTML = """
       );
     }
 
+    function renderSessions(sessions) {
+      const rows = sessions.map(item => `<tr>
+        <td>${escapeHtml(item.car_id)}</td>
+        <td>${escapeHtml(item.stream_id)}</td>
+        <td>${escapeHtml(item.algorithm_id)}</td>
+        <td>${item.active ? pill("active", "ok") : pill("stopped", "warn")}</td>
+        <td>${escapeHtml(String(item.threshold))}</td>
+        <td>${fmtTime(item.started_at)}</td>
+      </tr>`);
+      document.getElementById("sessionsTable").innerHTML = table(
+        ["car", "stream", "algorithm", "state", "threshold", "started"],
+        rows,
+        "No similarity session"
+      );
+    }
+
     function renderDebug(debug) {
       const entries = debug.recent_frames || [];
       const rows = entries.map(item => `<tr>
@@ -442,9 +508,135 @@ DASHBOARD_HTML = """
       }
     }
 
+    function readImagePayload(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(reader.error || new Error("failed to read image"));
+        reader.onload = () => {
+          const img = new Image();
+          img.onerror = () => reject(new Error("failed to decode image"));
+          img.onload = () => {
+            const dataUrl = String(reader.result || "");
+            resolve({
+              encoding: "jpeg",
+              width: img.naturalWidth || 1,
+              height: img.naturalHeight || 1,
+              data: dataUrl.includes(",") ? dataUrl.split(",", 2)[1] : dataUrl
+            });
+          };
+          img.src = String(reader.result || "");
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function simIds() {
+      return {
+        car_id: document.getElementById("simCarId").value.trim() || "car_001",
+        stream_id: document.getElementById("simStreamId").value.trim() || "camera_front",
+        algorithm_id: "yolov5-similarity",
+        threshold: Number(document.getElementById("simThreshold").value || 0.45)
+      };
+    }
+
+    function renderDefaultEdgeCommand() {
+      const ids = simIds();
+      const command = {
+        type: "jetcar_ai_control",
+        mode: "similarity",
+        car_id: ids.car_id,
+        stream_id: ids.stream_id,
+        algorithm_ids: ["yolov5-similarity"]
+      };
+      const box = document.getElementById("edgeCommand");
+      if (!box.dataset.edited) box.value = JSON.stringify(command, null, 2);
+    }
+
+    async function startSimilarity() {
+      const file = document.getElementById("simImage").files[0];
+      if (!file) {
+        text("simStatus", "Choose a target image first");
+        return;
+      }
+      const ids = simIds();
+      const image = await readImagePayload(file);
+      const response = await fetch("/api/similarity/search/start", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({...ids, image})
+      });
+      const data = await response.json();
+      text("simStatus", JSON.stringify(data));
+      await refresh();
+    }
+
+    async function stopSimilarity() {
+      const ids = simIds();
+      const response = await fetch("/api/similarity/search/stop", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(ids)
+      });
+      const data = await response.json();
+      text("simStatus", JSON.stringify(data));
+      await refresh();
+    }
+
+    async function sendEdgeControl(command) {
+      const edgeHost = document.getElementById("edgeHost").value.trim();
+      if (!edgeHost) {
+        text("simStatus", "Fill Edge Host before sending Edge control");
+        return;
+      }
+      const response = await fetch("/api/debug/edge-control", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          edge_host: edgeHost,
+          edge_port: Number(document.getElementById("edgePort").value || 6001),
+          command
+        })
+      });
+      const data = await response.json();
+      text("simStatus", JSON.stringify(data));
+      await refresh();
+    }
+
+    function edgeStartCommand() {
+      try {
+        return JSON.parse(document.getElementById("edgeCommand").value);
+      } catch (error) {
+        text("simStatus", "Edge command JSON is invalid: " + error);
+        return null;
+      }
+    }
+
+    function edgeStopCommand() {
+      const ids = simIds();
+      return {
+        type: "jetcar_ai_control",
+        mode: "stop",
+        car_id: ids.car_id,
+        stream_id: ids.stream_id,
+        algorithm_ids: []
+      };
+    }
+
     document.getElementById("refreshBtn").addEventListener("click", refresh);
     document.getElementById("openPreview").addEventListener("click", openPreview);
     document.getElementById("previewSelect").addEventListener("change", openPreview);
+    document.getElementById("startSimilarity").addEventListener("click", startSimilarity);
+    document.getElementById("stopSimilarity").addEventListener("click", stopSimilarity);
+    document.getElementById("edgeStart").addEventListener("click", () => {
+      const command = edgeStartCommand();
+      if (command) sendEdgeControl(command);
+    });
+    document.getElementById("edgeStop").addEventListener("click", () => sendEdgeControl(edgeStopCommand()));
+    document.getElementById("edgeCommand").addEventListener("input", event => {
+      event.currentTarget.dataset.edited = "true";
+    });
+    document.getElementById("simCarId").addEventListener("input", renderDefaultEdgeCommand);
+    document.getElementById("simStreamId").addEventListener("input", renderDefaultEdgeCommand);
     refresh();
     setInterval(refresh, 1500);
   </script>
