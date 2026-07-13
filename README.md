@@ -57,6 +57,19 @@ Health:
 curl http://127.0.0.1:8000/health
 ```
 
+Dashboard:
+
+```text
+http://127.0.0.1:8000/dashboard
+http://127.0.0.1:8000/unicorn
+```
+
+The dashboard is a read-only visual debugging page. It shows registered video
+streams, app websocket clients, loaded algorithms, active inference tasks,
+latest cached algorithm results, MJPEG preview links, and recent `.jetcar_debug`
+frame dumps. It polls `/api/dashboard/state` and does not start inference by
+itself.
+
 ## Algorithm Catalog
 
 The default catalog uses local runners:

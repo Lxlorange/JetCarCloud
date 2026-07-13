@@ -12,12 +12,13 @@ from pathlib import Path
 import cv2
 import requests
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import ValidationError
 
 from app.algorithms import AlgorithmCatalog, AlgorithmService
 from app.config import get_settings
 from app.connection_manager import ConnectionManager
+from app.dashboard import DASHBOARD_HTML
 from app.image_codec import decode_jpeg
 from app.inference.detector import build_detector
 from app.schemas import (
@@ -93,6 +94,54 @@ async def health() -> dict:
         "edge_frame_url": settings.edge_frame_url,
         "video_streams": len(video_streams.list()),
         "algorithms": [item.algorithm_id for item in algorithm_service.catalog.list()],
+    }
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/unicorn", response_class=HTMLResponse)
+async def unicorn_dashboard() -> HTMLResponse:
+    return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/api/dashboard/state")
+async def dashboard_state() -> dict:
+    now = time.time()
+    algorithms = algorithm_service.catalog.list()
+    streams = video_streams.list()
+    active_tasks = [
+        {
+            "car_id": car_id,
+            "stream_id": stream_id,
+            "algorithm_id": algorithm_id,
+        }
+        for (car_id, stream_id, algorithm_id), task in processing_tasks_by_key.items()
+        if not task.done()
+    ]
+    return {
+        "ok": True,
+        "service": settings.app_name,
+        "timestamp": now,
+        "detector": {
+            "class": detector.__class__.__name__,
+            "reason": getattr(detector, "reason", ""),
+        },
+        "connections": await manager.stats(),
+        "streams": [item.model_dump(mode="json") for item in streams],
+        "algorithms": [item.model_dump(mode="json") for item in algorithms],
+        "processing": {
+            "active_count": len(active_tasks),
+            "active_tasks": active_tasks,
+            "pending_task_count": sum(1 for task in processing_tasks if not task.done()),
+            "max_concurrent_tasks": settings.algorithm_max_concurrent_tasks,
+            "algorithm_min_interval_ms": settings.algorithm_min_interval_ms,
+            "video_push_min_interval_ms": settings.video_push_min_interval_ms,
+        },
+        "processed_frames": _dashboard_processed_frames(now),
+        "debug": _dashboard_debug_summary(),
     }
 
 
@@ -1008,6 +1057,87 @@ def _copy_algorithm_output_files(outputs: dict, target_dir: Path) -> None:
 
 def _safe_path_part(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value) or "unknown"
+
+
+def _dashboard_processed_frames(now: float) -> list[dict]:
+    rows: list[dict] = []
+    for (car_id, stream_id, algorithm_id), item in processed_frames.items():
+        result = item.result
+        rows.append(
+            {
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "algorithm_id": algorithm_id,
+                "timestamp": item.timestamp,
+                "age_seconds": round(max(0.0, now - item.timestamp), 3),
+                "ok": result.ok,
+                "runner": result.runner,
+                "latency_ms": round(result.latency_ms, 3),
+                "error": result.error,
+                "detection_count": _summarize_detection_count(result.result),
+                "summary": _dashboard_result_summary(result.result),
+                "annotated_image_present": result.annotated_image is not None,
+                "mjpeg_url": (
+                    f"/api/video/streams/{car_id}/{stream_id}/algorithms/"
+                    f"{algorithm_id}/mjpeg?fps=2"
+                ),
+            }
+        )
+    rows.sort(key=lambda item: item["timestamp"], reverse=True)
+    return rows
+
+
+def _dashboard_result_summary(payload: dict) -> str:
+    if not payload:
+        return ""
+    for key in ("summary", "message", "status"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value[:240]
+    detections = payload.get("detections")
+    if isinstance(detections, list) and detections:
+        labels = []
+        for item in detections[:5]:
+            if isinstance(item, dict):
+                label = item.get("label") or item.get("class") or item.get("name")
+                if label:
+                    labels.append(str(label))
+        if labels:
+            suffix = "" if len(detections) <= 5 else f" +{len(detections) - 5}"
+            return ", ".join(labels) + suffix
+    return json.dumps(payload, ensure_ascii=False)[:240]
+
+
+def _dashboard_debug_summary() -> dict:
+    recent_frames: list[dict] = []
+    if debug_dump_dir.exists():
+        frame_dirs = [
+            path
+            for path in debug_dump_dir.glob("*/*/frame_*")
+            if path.is_dir()
+        ]
+        frame_dirs.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in frame_dirs[:12]:
+            algorithm_dir = path / "algorithms"
+            algorithms = []
+            if algorithm_dir.exists():
+                algorithms = sorted(item.name for item in algorithm_dir.iterdir() if item.is_dir())
+            recent_frames.append(
+                {
+                    "car_id": path.parent.parent.name,
+                    "stream_id": path.parent.name,
+                    "frame": path.name,
+                    "modified_at": path.stat().st_mtime,
+                    "algorithms": algorithms,
+                }
+            )
+    return {
+        "enabled": settings.debug_dump_enabled,
+        "dir": str(debug_dump_dir),
+        "save_images": settings.debug_save_images,
+        "save_algorithm_outputs": settings.debug_save_algorithm_outputs,
+        "recent_frames": recent_frames,
+    }
 
 
 def _summarize_detection_count(payload: dict) -> int | str:
