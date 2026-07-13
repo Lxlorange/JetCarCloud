@@ -22,6 +22,7 @@ from app.connection_manager import ConnectionManager
 from app.dashboard import DASHBOARD_HTML
 from app.discovery import broadcast_discovery_beacon
 from app.image_codec import decode_jpeg
+from app.algorithms.local.similarity import extract_similarity_feature, save_similarity_feature
 from app.inference.detector import build_detector
 from app.schemas import (
     AlgorithmInfo,
@@ -261,6 +262,7 @@ async def compare_with_reference(payload: ImageUpload) -> SimilarityResult:
 @app.post("/api/similarity/search/start")
 async def start_similarity_search(payload: SimilaritySearchStartRequest) -> dict:
     image = decode_jpeg(payload.image)
+    target_feature = await asyncio.to_thread(extract_similarity_feature, image)
     session_dir = (
         Path(settings.algorithm_work_dir)
         / "similarity_sessions"
@@ -270,23 +272,29 @@ async def start_similarity_search(payload: SimilaritySearchStartRequest) -> dict
     )
     session_dir.mkdir(parents=True, exist_ok=True)
     template_path = session_dir / "target.jpg"
+    feature_path = session_dir / "target_feature.npy"
     _write_debug_image(template_path, image)
+    await asyncio.to_thread(save_similarity_feature, feature_path, target_feature)
     session = {
         "car_id": payload.car_id,
         "stream_id": payload.stream_id,
         "algorithm_id": payload.algorithm_id,
         "threshold": payload.threshold,
         "template_path": str(template_path),
+        "feature_path": str(feature_path),
+        "feature_dim": int(target_feature.shape[0]),
         "started_at": time.time(),
         "active": True,
     }
     similarity_sessions[(payload.car_id, payload.stream_id, payload.algorithm_id)] = session
     logger.info(
-        "similarity search started car_id=%s stream_id=%s algorithm_id=%s template=%s threshold=%.3f",
+        "similarity search started car_id=%s stream_id=%s algorithm_id=%s template=%s feature=%s dim=%s threshold=%.3f",
         payload.car_id,
         payload.stream_id,
         payload.algorithm_id,
         template_path,
+        feature_path,
+        target_feature.shape[0],
         payload.threshold,
     )
     return {
@@ -578,6 +586,7 @@ async def run_stream_algorithm_once(
             parameters.update(
                 {
                     "template_path": session["template_path"],
+                    "feature_path": session.get("feature_path", ""),
                     "threshold": session["threshold"],
                 }
             )
@@ -902,6 +911,7 @@ def _queue_algorithms_for_frame(
             parameters.update(
                 {
                     "template_path": session["template_path"],
+                    "feature_path": session.get("feature_path", ""),
                     "threshold": session["threshold"],
                 }
             )

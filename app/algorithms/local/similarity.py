@@ -10,6 +10,15 @@ from app.schemas import AlgorithmInfo
 from app.similarity import extract_feature_vector
 
 
+def extract_similarity_feature(image: np.ndarray) -> np.ndarray:
+    return extract_feature_vector(image)
+
+
+def save_similarity_feature(path: Path, feature: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(str(path), feature)
+
+
 class SimilarityAlgorithm:
     def __init__(self, *, project_root: Path, spec: AlgorithmInfo) -> None:
         self._project_root = project_root
@@ -52,7 +61,11 @@ class SimilarityAlgorithm:
             raise ValueError(f"failed to read template image: {template_path}")
 
         source_feature = extract_feature_vector(image)
-        template_feature = extract_feature_vector(template)
+        feature_path = parameters.get("feature_path")
+        if feature_path:
+            template_feature = np.load(str(feature_path))
+        else:
+            template_feature = extract_feature_vector(template)
         similarity = _cosine_similarity(source_feature, template_feature)
         matched = similarity >= threshold
         localization = _localize_template(image, template)
