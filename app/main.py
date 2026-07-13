@@ -30,6 +30,7 @@ from app.schemas import (
     AlgorithmRunResult,
     EdgeFrame,
     EdgeControlProxyRequest,
+    EdgeEventReport,
     ImageUpload,
     InferenceResult,
     ReferenceUploadResult,
@@ -353,6 +354,25 @@ async def proxy_edge_control(payload: EdgeControlProxyRequest) -> dict:
         "command": command,
         "response": response,
     }
+
+
+@app.post("/api/edge/events")
+async def report_edge_event(payload: EdgeEventReport) -> dict:
+    data = {
+        "type": "edge_similarity_search",
+        "car_id": payload.car_id,
+        "stream_id": payload.stream_id,
+        "event": payload.event,
+        **payload.payload,
+    }
+    await manager.publish(payload.car_id, data)
+    logger.info(
+        "edge event reported car_id=%s stream_id=%s event=%s",
+        payload.car_id,
+        payload.stream_id,
+        payload.event,
+    )
+    return {"ok": True, "published": True, "event": payload.event}
 
 
 def fetch_edge_frame(url: str):

@@ -59,6 +59,13 @@ class EdgeControlProxyRequest(BaseModel):
     timeout_seconds: float = Field(default=3.0, ge=0.2, le=30.0)
 
 
+class EdgeEventReport(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="camera_front", min_length=1)
+    event: str = Field(min_length=1)
+    payload: dict = Field(default_factory=dict)
+
+
 class ReferenceUploadResult(BaseModel):
     ok: bool = True
     car_id: str

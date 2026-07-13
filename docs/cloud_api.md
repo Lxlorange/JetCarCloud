@@ -341,3 +341,42 @@ POST /api/debug/edge-control
 ```
 
 Edge 使用 `center_norm[0]` 做左右对准：目标偏左/偏右时先原地转向，居中后才低速靠近。靠近阶段依赖雷达前方距离；如果没有雷达距离，Edge 默认停车等待，避免盲目前进。
+
+## 11. Edge final events
+
+Edge reports motion-loop events to Cloud so the phone can finish a similarity task only after the car has aligned/stopped, not merely after Cloud matched a frame.
+
+```text
+POST /api/edge/events
+```
+
+Request:
+
+```json
+{
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "event": "target_found",
+  "payload": {
+    "type": "edge_similarity_search",
+    "event": "target_found",
+    "state": "found",
+    "active": true,
+    "similarity": 0.72,
+    "center_norm": [0.48, 0.53],
+    "motion": {
+      "motion_state": "arrived",
+      "command": "stop",
+      "front_distance_m": 0.66
+    }
+  }
+}
+```
+
+Cloud forwards this payload to app WebSocket clients:
+
+```text
+WS /ws/inference/{car_id}/app
+```
+
+The phone freezes the latest annotated frame on `target_found` (or motion state `arrived` / `safety_stop`), sends Edge `mode=off`, and stops the Cloud similarity session.
