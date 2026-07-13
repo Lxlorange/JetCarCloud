@@ -1,76 +1,57 @@
-# JetCarCloud 接口说明
+# JetCarCloud API
 
-局域网地址：
+默认地址：
 
 ```text
 HTTP: http://<cloud-ip>:8000
 WS:   ws://<cloud-ip>:8000
 ```
 
-WSL2 运行时，`<cloud-ip>` 通常填写 Windows 主机的局域网 IP。
+WSL2 场景下，手机和 Jetson 通常填写 Windows 主机的局域网 IP。
 
-## 1. 路面巡检链路
+## 视频与算法
 
-路面巡检由手机端两个开关联动控制：
-
-```text
-mask[0] = 井盖检测 yolov5-manhole-detect
-mask[1] = 路面缺陷 yolov8-road-damage
-```
-
-示例：
+Edge 只在手机打开功能后才向 Cloud 推流：
 
 ```text
-TF -> 只开井盖检测
-FT -> 只开路面缺陷检测
-TT -> 两个模型都开
-FF -> 全部关闭，Edge 断开 Cloud 推流，Cloud 不再触发算法
+WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=<ids>&include_image=true
 ```
 
-手机端把 mask 发给小车端 Edge 的 AI 控制端口。Edge 根据 mask 更新它连接 Cloud 的 WebSocket：
+常用算法：
 
 ```text
-WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov5-manhole-detect&include_image=true
-WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov8-road-damage&include_image=true
-WS /ws/video/{car_id}/{stream_id}/edge?algorithm_ids=yolov5-manhole-detect,yolov8-road-damage&include_image=true
+yolov5-manhole-detect
+yolov8-road-damage
+yolov5-similarity
 ```
 
-Edge 发给 Cloud 的每帧 JSON：
+处理后画面：
 
-```json
-{
-  "car_id": "car_001",
-  "image": {
-    "encoding": "jpeg",
-    "width": 640,
-    "height": 480,
-    "data": "base64-encoded-jpeg"
-  }
-}
+```text
+GET /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg?fps=5
 ```
 
-Cloud 会按 `VIDEO_PUSH_MIN_INTERVAL_MS`、`ALGORITHM_MIN_INTERVAL_MS` 和
-`ALGORITHM_MAX_CONCURRENT_TASKS` 限流。结果通过手机端结果 WebSocket 返回。
+手机接收结果：
 
-## 2. Edge AI 控制端口
+```text
+WS /ws/inference/{car_id}/app
+```
 
-JetCarEdge 额外提供一个轻量 TCP 控制端口，默认：
+## Edge 控制
+
+Edge AI 控制端口默认：
 
 ```text
 tcp://<edge-ip>:6001
 ```
 
-每条消息是一行 JSON，Edge 返回一行 JSON。路面巡检示例：
+路面巡检开关使用 mask：
 
 ```json
 {"type":"jetcar_ai_control","mode":"road_inspection","car_id":"car_001","stream_id":"camera_front","mask":"TF"}
 ```
 
-关闭所有 AI：
-
-```json
-{"type":"jetcar_ai_control","mode":"off","car_id":"car_001","stream_id":"camera_front","mask":"FF","algorithm_ids":[]}
-```
+`TF` 表示井盖开、路面缺陷关；`TT` 两个都开；`FF` 全关并停止推流。
 
 相似度寻物：
 
@@ -78,65 +59,67 @@ tcp://<edge-ip>:6001
 {"type":"jetcar_ai_control","mode":"similarity","car_id":"car_001","stream_id":"camera_front","algorithm_ids":["yolov5-similarity"]}
 ```
 
-Edge 收到空算法列表或 `FF` 时应停止上传并断开 Cloud WebSocket，用于省电和避免无意义推理。
-
-## 3. 手机端结果通道
-
-手机端连接：
-
-```text
-WS /ws/inference/{car_id}/app
-```
-
-主要事件：
+关闭：
 
 ```json
-{
-  "type": "algorithm_result",
-  "ok": true,
-  "algorithm_id": "yolov8-road-damage",
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "runner": "local",
-  "latency_ms": 1234.5,
-  "result": {
-    "detection_count": 1,
-    "detections": []
-  },
-  "annotated_image": null,
-  "error": ""
-}
+{"type":"jetcar_ai_control","mode":"off","car_id":"car_001","stream_id":"camera_front","algorithm_ids":[]}
 ```
 
-显示处理后画面：
+## 自动任务控制
+
+Edge 自动任务端口默认：
 
 ```text
-GET /api/video/streams/{car_id}/{stream_id}/algorithms/{algorithm_id}/mjpeg?fps=5
+tcp://<edge-ip>:6002
 ```
 
-该接口只输出最新缓存的处理后画面，不主动触发算法。算法由 Edge 推帧触发。
-
-## 4. 相似度寻物链路
-
-相似度寻物和路面巡检是独立逻辑：
-
-1. 手机端上传目标图片到 Cloud。
-2. Cloud 保存本次寻物会话的目标图。
-3. 手机端通知 Edge 开启 `yolov5-similarity`。
-4. Edge 持续推摄像头帧到 Cloud。
-5. Cloud 用每帧和目标图做相似度判断。
-6. 一旦 `matched=true`，手机端结束任务，并通知 Edge/Cloud 停止。
-
-Edge 端也可以同时连接手机端结果通道：
+该端口由 `jetcar_edge task_orchestrator_node` 提供。它假设 Nav2 已启动并暴露：
 
 ```text
-WS /ws/inference/{car_id}/app
+Action: /navigate_to_pose
+Pose:   /amcl_pose
+Cmd:    /cmd_vel
 ```
 
-这样 Edge 不需要等待上传 WebSocket 的逐帧响应，而是直接接收 Cloud 广播的
-`algorithm_result`，并在本地做运动闭环和安全停止。
+前往目标点：
 
-启动会话：
+```json
+{"type":"jetcar_task_control","mode":"navigate_to_point","car_id":"car_001","stream_id":"camera_front","x":1.0,"y":0.5,"yaw":0.0}
+```
+
+自动巡检。Edge 会按 `waypoints.yaml` 的 `inspection` 路径导航，并打开井盖+路面缺陷检测：
+
+```json
+{"type":"jetcar_task_control","mode":"inspection_task","car_id":"car_001","stream_id":"camera_front"}
+```
+
+地图寻物。手机需先上传目标图到 Cloud，然后发该命令。Edge 会按 `waypoints.yaml` 的 `search` 路径导航，并打开 similarity 算法；Cloud 匹配后 Edge 再执行最后对准/靠近：
+
+```json
+{"type":"jetcar_task_control","mode":"similarity_search_task","car_id":"car_001","stream_id":"camera_front"}
+```
+
+停止任务：
+
+```json
+{"type":"jetcar_task_control","mode":"stop_task","car_id":"car_001","stream_id":"camera_front"}
+```
+
+任务状态由 Edge 发布到 `/jetcar/task_status`，再由上传节点上报 Cloud：
+
+```text
+POST /api/edge/events
+```
+
+Cloud 查询最新任务状态：
+
+```text
+GET /api/tasks/{car_id}/{stream_id}/latest
+```
+
+## Similarity Session
+
+上传目标图并生成目标特征：
 
 ```text
 POST /api/similarity/search/start
@@ -150,91 +133,33 @@ POST /api/similarity/search/start
   "stream_id": "camera_front",
   "algorithm_id": "yolov5-similarity",
   "threshold": 0.45,
-  "image": {
-    "encoding": "jpeg",
-    "width": 1280,
-    "height": 720,
-    "data": "base64-encoded-jpeg"
-  }
+  "image": {"encoding":"jpeg","width":1280,"height":720,"data":"base64"}
 }
 ```
 
-响应：
-
-```json
-{
-  "ok": true,
-  "type": "similarity_search_session",
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "algorithm_id": "yolov5-similarity",
-  "threshold": 0.45,
-  "template_path": ".jetcar_algorithm_runs/similarity_sessions/car_001/camera_front/yolov5-similarity/target.jpg",
-  "active": true,
-  "edge_mask": "similarity",
-  "edge_algorithm_ids": ["yolov5-similarity"]
-}
-```
-
-停止会话：
+停止 session：
 
 ```text
 POST /api/similarity/search/stop
 ```
 
+## 报告与调试
+
+生成当前缓存结果报告：
+
+```text
+POST /api/tasks/report
+```
+
 请求：
 
 ```json
-{
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "algorithm_id": "yolov5-similarity"
-}
+{"car_id":"car_001","stream_id":"camera_front","task_id":"inspection-demo","mode":"inspection_task","summary":{}}
 ```
 
-相似度结果示例：
+Cloud 会保存到 `.jetcar_reports/`。
 
-```json
-{
-  "type": "algorithm_result",
-  "ok": true,
-  "algorithm_id": "yolov5-similarity",
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "result": {
-    "task": "similarity",
-    "matched": true,
-    "similarity": 0.72,
-    "threshold": 0.45
-  }
-}
-```
-
-如果 Edge 在没有启动相似度会话时请求 `yolov5-similarity`，Cloud 会跳过该算法，避免拿旧模板误判。
-
-## 5. 算法管理
-
-查看算法：
-
-```text
-GET /api/algorithms
-```
-
-修改 `algorithms.json` 后重载：
-
-```text
-POST /api/algorithms/reload
-```
-
-当前默认算法：
-
-```text
-yolov5-similarity
-yolov5-manhole-detect
-yolov8-road-damage
-```
-
-## 6. 调试页面
+调试页面：
 
 ```text
 GET /dashboard
@@ -242,141 +167,32 @@ GET /unicorn
 GET /api/dashboard/state
 ```
 
-页面展示视频流、算法表、活跃任务、相似度会话、最近处理结果和 `.jetcar_debug` 目录摘要。
-
-## 7. 健康检查
+调试目录：
 
 ```text
-GET /health
+.jetcar_debug
+.jetcar_algorithm_runs
+.jetcar_reports
+.jetcar_maps
 ```
 
-## 8. Cloud IP 自动发现
+## 上车后必须确认
 
-Cloud 可以向局域网广播自己的 HTTP 地址，Edge 启动时可以监听该广播并自动设置 `cloud_host`。默认关闭，避免多网卡环境误选。
+在 Jetson 容器中确认 Nav2 名称：
 
-Cloud `.env` 示例：
+```bash
+source /opt/ros/foxy/setup.bash
+source /workspace/install/setup.bash
+ros2 action list
+ros2 action info /navigate_to_pose
+ros2 topic list | grep -E 'amcl|pose|map|tf|goal|cmd_vel'
+```
+
+如果 action/topic 名称不同，只改 `edge.yaml` 或 launch 参数：
 
 ```text
-DISCOVERY_BEACON_ENABLED=true
-DISCOVERY_BEACON_PORT=8765
-DISCOVERY_BEACON_INTERVAL_SECONDS=1.0
-DISCOVERY_BEACON_HOST=
+navigate_action
+amcl_pose_topic
+cmd_vel_topic
+waypoints_file
 ```
-
-`DISCOVERY_BEACON_HOST` 为空时 Cloud 会尝试自动取本机局域网 IP。WSL2 下如果自动取到的是 WSL 内部地址，可以手动填 Windows 主机局域网 IP。
-
-Edge 参数：
-
-```text
-cloud_discovery_enabled: true
-cloud_discovery_port: 8765
-cloud_discovery_listen_seconds: 2.0
-```
-
-如果 Edge 在超时时间内没有收到 beacon，会继续使用配置文件里的 `cloud_host`。
-
-## 9. 网页调试 Edge 控制
-
-`/dashboard` 和 `/unicorn` 增加了 Similarity Search 面板，可完成：
-
-- 上传目标图片并调用 `POST /api/similarity/search/start`
-- 停止相似度 session
-- 向 Edge TCP 控制口发送启动/停止 JSON
-- 查看 similarity session、最新算法结果、处理后 MJPEG 画面和 debug dump
-
-Cloud 转发 Edge 控制命令：
-
-```text
-POST /api/debug/edge-control
-```
-
-请求：
-
-```json
-{
-  "edge_host": "192.168.10.50",
-  "edge_port": 6001,
-  "command": {
-    "type": "jetcar_ai_control",
-    "mode": "similarity",
-    "car_id": "car_001",
-    "stream_id": "camera_front",
-    "algorithm_ids": ["yolov5-similarity"]
-  }
-}
-```
-
-停止：
-
-```json
-{
-  "edge_host": "192.168.10.50",
-  "edge_port": 6001,
-  "command": {
-    "type": "jetcar_ai_control",
-    "mode": "stop",
-    "car_id": "car_001",
-    "stream_id": "camera_front",
-    "algorithm_ids": []
-  }
-}
-```
-
-## 10. 相似度寻物运动闭环字段
-
-`yolov5-similarity` 结果会返回目标位置估计：
-
-```json
-{
-  "matched": true,
-  "similarity": 0.72,
-  "threshold": 0.45,
-  "center_norm": [0.48, 0.53],
-  "bbox_norm": [0.30, 0.25, 0.66, 0.75],
-  "localization": {
-    "method": "orb_homography",
-    "matched_keypoints": 18
-  }
-}
-```
-
-Edge 使用 `center_norm[0]` 做左右对准：目标偏左/偏右时先原地转向，居中后才低速靠近。靠近阶段依赖雷达前方距离；如果没有雷达距离，Edge 默认停车等待，避免盲目前进。
-
-## 11. Edge final events
-
-Edge reports motion-loop events to Cloud so the phone can finish a similarity task only after the car has aligned/stopped, not merely after Cloud matched a frame.
-
-```text
-POST /api/edge/events
-```
-
-Request:
-
-```json
-{
-  "car_id": "car_001",
-  "stream_id": "camera_front",
-  "event": "target_found",
-  "payload": {
-    "type": "edge_similarity_search",
-    "event": "target_found",
-    "state": "found",
-    "active": true,
-    "similarity": 0.72,
-    "center_norm": [0.48, 0.53],
-    "motion": {
-      "motion_state": "arrived",
-      "command": "stop",
-      "front_distance_m": 0.66
-    }
-  }
-}
-```
-
-Cloud forwards this payload to app WebSocket clients:
-
-```text
-WS /ws/inference/{car_id}/app
-```
-
-The phone freezes the latest annotated frame on `target_found` (or motion state `arrived` / `safety_stop`), sends Edge `mode=off`, and stops the Cloud similarity session.

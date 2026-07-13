@@ -66,6 +66,14 @@ class EdgeEventReport(BaseModel):
     payload: dict = Field(default_factory=dict)
 
 
+class TaskReportRequest(BaseModel):
+    car_id: str = Field(default="car_001", min_length=1)
+    stream_id: str = Field(default="camera_front", min_length=1)
+    task_id: str = Field(default="", min_length=0)
+    mode: str = Field(default="", min_length=0)
+    summary: dict = Field(default_factory=dict)
+
+
 class ReferenceUploadResult(BaseModel):
     ok: bool = True
     car_id: str

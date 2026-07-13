@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     debug_save_images: bool = True
     debug_save_algorithm_outputs: bool = True
     debug_dump_skipped_frames: bool = False
+    reports_dir: str = ".jetcar_reports"
+    map_dir: str = ".jetcar_maps"
     discovery_beacon_enabled: bool = False
     discovery_beacon_port: int = Field(default=8765, ge=1, le=65535)
     discovery_beacon_interval_seconds: float = Field(default=1.0, ge=0.2)

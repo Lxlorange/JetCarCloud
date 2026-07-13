@@ -262,6 +262,10 @@ DASHBOARD_HTML = """
           <h2>Algorithm Catalog</h2>
           <div id="algorithmsTable"></div>
         </div>
+        <div class="panel">
+          <h2>Edge Tasks</h2>
+          <div id="edgeTasksTable"></div>
+        </div>
       </div>
 
       <aside class="stack">
@@ -370,6 +374,7 @@ DASHBOARD_HTML = """
       renderStreams(streams);
       renderResults(results);
       renderAlgorithms(algorithms);
+      renderEdgeTasks(data.edge_tasks || []);
       renderSessions(data.similarity_sessions || []);
       renderDebug(data.debug || {});
       renderPreviewOptions(results);
@@ -433,6 +438,29 @@ DASHBOARD_HTML = """
         ["id", "runner", "enabled", "task", "model"],
         rows,
         "No algorithms loaded"
+      );
+    }
+
+    function renderEdgeTasks(tasks) {
+      const rows = tasks.map(item => {
+        const latest = item.latest || {};
+        const pose = latest.pose || {};
+        const status = latest.status || latest.event || "-";
+        const active = latest.active ? pill("active", "ok") : pill(status, status === "failed" ? "bad" : "warn");
+        const xy = (pose.x === undefined || pose.y === undefined) ? "-" : `${pose.x}, ${pose.y}`;
+        return `<tr>
+          <td>${escapeHtml(item.car_id)} / ${escapeHtml(item.stream_id)}</td>
+          <td>${escapeHtml(latest.mode || "")}</td>
+          <td>${active}</td>
+          <td>${escapeHtml(latest.message || "")}</td>
+          <td>${escapeHtml(String(latest.current_index ?? "-"))}/${escapeHtml(String(latest.total ?? "-"))}</td>
+          <td>${escapeHtml(xy)}</td>
+        </tr>`;
+      });
+      document.getElementById("edgeTasksTable").innerHTML = table(
+        ["stream", "mode", "status", "message", "progress", "pose"],
+        rows,
+        "No Edge task status yet"
       );
     }
 

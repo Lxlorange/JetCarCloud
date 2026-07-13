@@ -37,6 +37,7 @@ from app.schemas import (
     SimilarityResult,
     SimilaritySearchStartRequest,
     SimilaritySearchStopRequest,
+    TaskReportRequest,
     VideoChunkUpload,
     VideoFrameUploadResult,
     VideoFramePreprocessResult,
@@ -73,6 +74,7 @@ algorithm_service = AlgorithmService(
 app = FastAPI(title=settings.app_name)
 reference_images = {}
 similarity_sessions: dict[tuple[str, str, str], dict] = {}
+edge_task_events: dict[tuple[str, str], list[dict]] = {}
 video_streams = VideoStreamRegistry()
 stream_workers: dict[tuple[str, str], asyncio.Task] = {}
 discovery_task: asyncio.Task | None = None
@@ -90,6 +92,8 @@ processing_tasks: set[asyncio.Task] = set()
 processing_tasks_by_key: dict[tuple[str, str, str], asyncio.Task] = {}
 algorithm_last_started_at: dict[tuple[str, str, str], float] = {}
 debug_dump_dir = Path(settings.debug_dump_dir)
+reports_dir = Path(settings.reports_dir)
+map_dir = Path(settings.map_dir)
 
 
 @app.on_event("startup")
@@ -184,6 +188,7 @@ async def dashboard_state() -> dict:
             "video_push_min_interval_ms": settings.video_push_min_interval_ms,
         },
         "similarity_sessions": list(similarity_sessions.values()),
+        "edge_tasks": _dashboard_edge_tasks(),
         "processed_frames": _dashboard_processed_frames(now),
         "debug": _dashboard_debug_summary(),
         "discovery": {
@@ -366,6 +371,8 @@ async def report_edge_event(payload: EdgeEventReport) -> dict:
         **payload.payload,
     }
     await manager.publish(payload.car_id, data)
+    if payload.event == "task_status" or data.get("type") == "edge_task_state":
+        _record_edge_task_event(payload.car_id, payload.stream_id, data)
     logger.info(
         "edge event reported car_id=%s stream_id=%s event=%s",
         payload.car_id,
@@ -373,6 +380,58 @@ async def report_edge_event(payload: EdgeEventReport) -> dict:
         payload.event,
     )
     return {"ok": True, "published": True, "event": payload.event}
+
+
+@app.get("/api/tasks/{car_id}/{stream_id}/latest")
+async def latest_task_events(car_id: str, stream_id: str, limit: int = Query(default=20, ge=1, le=200)) -> dict:
+    events = edge_task_events.get((car_id, stream_id), [])
+    return {
+        "ok": True,
+        "car_id": car_id,
+        "stream_id": stream_id,
+        "events": events[-limit:],
+        "latest": events[-1] if events else None,
+    }
+
+
+@app.post("/api/tasks/report")
+async def write_task_report(payload: TaskReportRequest) -> dict:
+    task_id = payload.task_id.strip() or f"{payload.mode or 'task'}-{int(time.time() * 1000)}"
+    report_dir = reports_dir / _safe_path_part(payload.car_id) / _safe_path_part(payload.stream_id) / _safe_path_part(task_id)
+    report_dir.mkdir(parents=True, exist_ok=True)
+    results = [
+        {
+            "key": "/".join(key),
+            "algorithm_id": key[2],
+            "timestamp": item.timestamp,
+            "result": item.result.model_dump(mode="json"),
+        }
+        for key, item in processed_frames.items()
+        if key[0] == payload.car_id and key[1] == payload.stream_id
+    ]
+    report = {
+        "ok": True,
+        "car_id": payload.car_id,
+        "stream_id": payload.stream_id,
+        "task_id": task_id,
+        "mode": payload.mode,
+        "summary": payload.summary,
+        "result_count": len(results),
+        "results": results,
+        "created_at": time.time(),
+    }
+    path = report_dir / "report.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "task_id": task_id, "report_path": str(path), "result_count": len(results)}
+
+
+@app.get("/api/maps")
+async def list_maps() -> dict:
+    map_dir.mkdir(parents=True, exist_ok=True)
+    items = []
+    for yaml_path in sorted(map_dir.glob("*.yaml")):
+        items.append({"map_id": yaml_path.stem, "yaml_path": str(yaml_path)})
+    return {"ok": True, "maps": items}
 
 
 def fetch_edge_frame(url: str):
@@ -1306,6 +1365,32 @@ def _dashboard_processed_frames(now: float) -> list[dict]:
             }
         )
     rows.sort(key=lambda item: item["timestamp"], reverse=True)
+    return rows
+
+
+def _record_edge_task_event(car_id: str, stream_id: str, data: dict) -> None:
+    key = (car_id, stream_id)
+    event = dict(data)
+    event["received_at"] = time.time()
+    events = edge_task_events.setdefault(key, [])
+    events.append(event)
+    if len(events) > 200:
+        del events[: len(events) - 200]
+
+
+def _dashboard_edge_tasks() -> list[dict]:
+    rows = []
+    for (car_id, stream_id), events in edge_task_events.items():
+        latest = events[-1] if events else {}
+        rows.append(
+            {
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "event_count": len(events),
+                "latest": latest,
+            }
+        )
+    rows.sort(key=lambda item: item["latest"].get("received_at", 0), reverse=True)
     return rows
 
 
