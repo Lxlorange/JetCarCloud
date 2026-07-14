@@ -363,15 +363,29 @@ async def proxy_edge_control(payload: EdgeControlProxyRequest) -> dict:
 
 @app.post("/api/edge/events")
 async def report_edge_event(payload: EdgeEventReport) -> dict:
-    data = {
-        "type": "edge_similarity_search",
-        "car_id": payload.car_id,
-        "stream_id": payload.stream_id,
-        "event": payload.event,
-        **payload.payload,
-    }
+    data = dict(payload.payload)
+    data.setdefault("type", "edge_similarity_search")
+    data["car_id"] = payload.car_id
+    data["stream_id"] = payload.stream_id
+    data["event"] = payload.event
+    if data.get("type") == "edge_road_inspection":
+        count = data.get("count", "-")
+        target_count = data.get("target_count", "-")
+        if payload.event == "inspection_complete":
+            data.setdefault("status", "complete")
+            data.setdefault("message", f"road inspection complete {count}/{target_count}")
+        elif payload.event == "inspection_detection":
+            data.setdefault("status", "running")
+            data.setdefault("message", f"road inspection detection {count}/{target_count}")
+        elif payload.event == "inspection_warning":
+            data.setdefault("status", "warning")
+            data.setdefault("message", f"road inspection warning: {data.get('reason', '')}")
     await manager.publish(payload.car_id, data)
-    if payload.event == "task_status" or data.get("type") == "edge_task_state":
+    if (
+        payload.event == "task_status"
+        or data.get("type") == "edge_task_state"
+        or data.get("type") == "edge_road_inspection"
+    ):
         _record_edge_task_event(payload.car_id, payload.stream_id, data)
     logger.info(
         "edge event reported car_id=%s stream_id=%s event=%s",
