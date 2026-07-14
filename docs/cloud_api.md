@@ -154,7 +154,7 @@ POST /api/similarity/search/start
   "car_id": "car_001",
   "stream_id": "camera_front",
   "algorithm_id": "yolov5-similarity",
-  "threshold": 0.45,
+  "threshold": 0.70,
   "image": {"encoding":"jpeg","width":1280,"height":720,"data":"base64"}
 }
 ```

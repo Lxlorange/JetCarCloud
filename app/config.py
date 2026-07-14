@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     video_default_fps: float = Field(default=2.0, ge=0.1, le=30.0)
     video_capture_timeout_ms: int = Field(default=5000, ge=100)
     video_push_min_interval_ms: int = Field(default=200, ge=0)
-    algorithm_min_interval_ms: int = Field(default=1000, ge=0)
+    algorithm_min_interval_ms: int = Field(default=500, ge=0)
     algorithm_max_concurrent_tasks: int = Field(default=2, ge=1)
     algorithm_catalog_path: str = "algorithms.json"
     algorithm_work_dir: str = ".jetcar_algorithm_runs"

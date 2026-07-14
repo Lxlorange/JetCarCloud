@@ -188,7 +188,7 @@ but it does not run every incoming frame through every model:
 
 ```text
 VIDEO_PUSH_MIN_INTERVAL_MS=200       # accept at most about 5 pushed frames/s per stream
-ALGORITHM_MIN_INTERVAL_MS=1000       # start each algorithm at most about 1 time/s per stream
+ALGORITHM_MIN_INTERVAL_MS=500        # start each algorithm at most about 2 times/s per stream
 ALGORITHM_MAX_CONCURRENT_TASKS=2     # total algorithm tasks running at the same time
 DEBUG_DUMP_SKIPPED_FRAMES=false      # skipped frames are not written to .jetcar_debug
 ```

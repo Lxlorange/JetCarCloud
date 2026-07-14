@@ -284,8 +284,8 @@ DASHBOARD_HTML = """
             <label>Car ID<input id="simCarId" value="car_001"></label>
             <label>Stream ID<input id="simStreamId" value="camera_front"></label>
             <label>Edge Host<input id="edgeHost" placeholder="192.168.10.x"></label>
-            <label>Edge Port<input id="edgePort" type="number" value="6001"></label>
-            <label>Threshold<input id="simThreshold" type="number" step="0.01" min="0" max="1" value="0.45"></label>
+            <label>Edge Port<input id="edgePort" type="number" value="6002"></label>
+            <label>Threshold<input id="simThreshold" type="number" step="0.01" min="0" max="1" value="0.70"></label>
             <label class="wide">Target Image<input id="simImage" type="file" accept="image/*"></label>
           </div>
           <div class="actions">
@@ -563,7 +563,7 @@ DASHBOARD_HTML = """
         car_id: document.getElementById("simCarId").value.trim() || "car_001",
         stream_id: document.getElementById("simStreamId").value.trim() || "camera_front",
         algorithm_id: "yolov5-similarity",
-        threshold: Number(document.getElementById("simThreshold").value || 0.45)
+        threshold: Number(document.getElementById("simThreshold").value || 0.70)
       };
     }
 
@@ -621,7 +621,7 @@ DASHBOARD_HTML = """
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           edge_host: edgeHost,
-          edge_port: Number(document.getElementById("edgePort").value || 6001),
+          edge_port: Number(document.getElementById("edgePort").value || 6002),
           command
         })
       });

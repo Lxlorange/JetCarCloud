@@ -12,7 +12,7 @@
         "task": "similarity",
         "model_path": "models/yolov5-similarity/yolov5s.pt",
         "template_path": "models/yolov5-similarity/target.jpg",
-        "threshold": 0.45
+        "threshold": 0.70
       }
     },
     "yolov5-manhole-detect": {
