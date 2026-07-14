@@ -105,6 +105,28 @@ Cmd:    /cmd_vel
 {"type":"jetcar_task_control","mode":"stop_task","car_id":"car_001","stream_id":"camera_front"}
 ```
 
+临时更新 Edge 内存中的 waypoint，不需要重新编译：
+
+```json
+{
+  "type": "jetcar_task_control",
+  "mode": "set_waypoints",
+  "car_id": "car_001",
+  "stream_id": "camera_front",
+  "name": "inspection",
+  "waypoints": [
+    {"label":"p1","x":0.0,"y":0.0,"yaw":0.0,"hold_seconds":1.0},
+    {"label":"p2","x":1.0,"y":0.0,"yaw":0.0,"hold_seconds":1.0}
+  ]
+}
+```
+
+查看 Edge 当前内存 waypoint：
+
+```json
+{"type":"jetcar_task_control","mode":"list_waypoints","car_id":"car_001","stream_id":"camera_front"}
+```
+
 任务状态由 Edge 发布到 `/jetcar/task_status`，再由上传节点上报 Cloud：
 
 ```text
@@ -158,6 +180,34 @@ POST /api/tasks/report
 ```
 
 Cloud 会保存到 `.jetcar_reports/`。
+
+列出报告：
+
+```text
+GET /api/tasks/reports?car_id=car_001&stream_id=camera_front
+```
+
+报告响应会返回 `report_url`，例如：
+
+```text
+/api/tasks/reports/car_001/camera_front/inspection_task-123/index.html
+```
+
+报告目录中会保存：
+
+```text
+report.json
+index.html
+images/*.jpg
+```
+
+地图文件列表：
+
+```text
+GET /api/maps
+GET /api/maps/{map_id}
+GET /api/maps/{map_id}/image
+```
 
 调试页面：
 

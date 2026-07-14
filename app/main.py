@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import requests
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import ValidationError
 
 from app.algorithms import AlgorithmCatalog, AlgorithmService
@@ -398,17 +398,32 @@ async def latest_task_events(car_id: str, stream_id: str, limit: int = Query(def
 async def write_task_report(payload: TaskReportRequest) -> dict:
     task_id = payload.task_id.strip() or f"{payload.mode or 'task'}-{int(time.time() * 1000)}"
     report_dir = reports_dir / _safe_path_part(payload.car_id) / _safe_path_part(payload.stream_id) / _safe_path_part(task_id)
+    image_dir = report_dir / "images"
     report_dir.mkdir(parents=True, exist_ok=True)
-    results = [
-        {
-            "key": "/".join(key),
-            "algorithm_id": key[2],
-            "timestamp": item.timestamp,
-            "result": item.result.model_dump(mode="json"),
-        }
-        for key, item in processed_frames.items()
-        if key[0] == payload.car_id and key[1] == payload.stream_id
-    ]
+    image_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    for key, item in processed_frames.items():
+        if key[0] != payload.car_id or key[1] != payload.stream_id:
+            continue
+        algorithm_id = key[2]
+        image_name = ""
+        if item.result.annotated_image is not None:
+            image_name = f"{_safe_path_part(algorithm_id)}-{int(item.timestamp * 1000)}.jpg"
+            try:
+                (image_dir / image_name).write_bytes(base64.b64decode(item.result.annotated_image.data))
+            except Exception:
+                logger.exception("failed to save report image algorithm_id=%s", algorithm_id)
+                image_name = ""
+        results.append(
+            {
+                "key": "/".join(key),
+                "algorithm_id": algorithm_id,
+                "timestamp": item.timestamp,
+                "image": f"images/{image_name}" if image_name else "",
+                "result": item.result.model_dump(mode="json"),
+            }
+        )
+    results.sort(key=lambda item: item["timestamp"], reverse=True)
     report = {
         "ok": True,
         "car_id": payload.car_id,
@@ -422,7 +437,63 @@ async def write_task_report(payload: TaskReportRequest) -> dict:
     }
     path = report_dir / "report.json"
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    return {"ok": True, "task_id": task_id, "report_path": str(path), "result_count": len(results)}
+    html_path = report_dir / "index.html"
+    html_path.write_text(_render_task_report_html(report), encoding="utf-8")
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "report_path": str(path),
+        "html_path": str(html_path),
+        "result_count": len(results),
+        "report_url": f"/api/tasks/reports/{payload.car_id}/{payload.stream_id}/{task_id}/index.html",
+    }
+
+
+@app.get("/api/tasks/reports")
+async def list_task_reports(car_id: str | None = None, stream_id: str | None = None) -> dict:
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    pattern = "*/*/report.json"
+    for path in reports_dir.glob(pattern):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if car_id and data.get("car_id") != car_id:
+            continue
+        if stream_id and data.get("stream_id") != stream_id:
+            continue
+        rows.append(
+            {
+                "car_id": data.get("car_id", ""),
+                "stream_id": data.get("stream_id", ""),
+                "task_id": data.get("task_id", ""),
+                "mode": data.get("mode", ""),
+                "created_at": data.get("created_at", 0),
+                "result_count": data.get("result_count", 0),
+                "report_url": f"/api/tasks/reports/{data.get('car_id', '')}/{data.get('stream_id', '')}/{data.get('task_id', '')}/index.html",
+            }
+        )
+    rows.sort(key=lambda item: item["created_at"], reverse=True)
+    return {"ok": True, "reports": rows}
+
+
+@app.get("/api/tasks/reports/{car_id}/{stream_id}/{task_id}/{path:path}")
+async def get_task_report_file(car_id: str, stream_id: str, task_id: str, path: str) -> FileResponse:
+    root = (
+        reports_dir
+        / _safe_path_part(car_id)
+        / _safe_path_part(stream_id)
+        / _safe_path_part(task_id)
+    ).resolve()
+    target = (root / path).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="report file not found")
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="report file not found")
+    return FileResponse(target)
 
 
 @app.get("/api/maps")
@@ -430,8 +501,45 @@ async def list_maps() -> dict:
     map_dir.mkdir(parents=True, exist_ok=True)
     items = []
     for yaml_path in sorted(map_dir.glob("*.yaml")):
-        items.append({"map_id": yaml_path.stem, "yaml_path": str(yaml_path)})
+        items.append({"map_id": yaml_path.stem, "yaml_path": str(yaml_path), "metadata_url": f"/api/maps/{yaml_path.stem}"})
     return {"ok": True, "maps": items}
+
+
+@app.get("/api/maps/{map_id}")
+async def get_map_metadata(map_id: str) -> dict:
+    yaml_path = map_dir / f"{_safe_path_part(map_id)}.yaml"
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail="map yaml not found")
+    metadata = _read_map_yaml(yaml_path)
+    image_name = str(metadata.get("image") or "")
+    image_path = (yaml_path.parent / image_name).resolve() if image_name else None
+    return {
+        "ok": True,
+        "map_id": map_id,
+        "yaml_path": str(yaml_path),
+        "metadata": metadata,
+        "image_url": f"/api/maps/{map_id}/image" if image_path and image_path.exists() else "",
+    }
+
+
+@app.get("/api/maps/{map_id}/image")
+async def get_map_image(map_id: str) -> FileResponse:
+    yaml_path = map_dir / f"{_safe_path_part(map_id)}.yaml"
+    if not yaml_path.exists():
+        raise HTTPException(status_code=404, detail="map yaml not found")
+    metadata = _read_map_yaml(yaml_path)
+    image_name = str(metadata.get("image") or "")
+    if not image_name:
+        raise HTTPException(status_code=404, detail="map image not configured")
+    root = yaml_path.parent.resolve()
+    image_path = (root / image_name).resolve()
+    try:
+        image_path.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="map image not found")
+    if not image_path.exists() or not image_path.is_file():
+        raise HTTPException(status_code=404, detail="map image not found")
+    return FileResponse(image_path)
 
 
 def fetch_edge_frame(url: str):
@@ -1319,6 +1427,76 @@ def _write_debug_image(path: Path, image) -> None:
 
 def _write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _render_task_report_html(report: dict) -> str:
+    rows = []
+    for item in report.get("results", []):
+        result = item.get("result", {})
+        payload = result.get("result", {}) if isinstance(result, dict) else {}
+        summary = _dashboard_result_summary(payload if isinstance(payload, dict) else {})
+        image = item.get("image") or ""
+        image_html = f'<img src="{image}" alt="{item.get("algorithm_id", "")}">' if image else ""
+        rows.append(
+            "<tr>"
+            f"<td>{_html_escape(item.get('algorithm_id', ''))}</td>"
+            f"<td>{time.strftime('%H:%M:%S', time.localtime(float(item.get('timestamp', 0) or 0)))}</td>"
+            f"<td>{_html_escape(summary)}</td>"
+            f"<td>{image_html}</td>"
+            "</tr>"
+        )
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JetCar Task Report</title>
+  <style>
+    body {{ font: 14px/1.5 system-ui, sans-serif; margin: 24px; color: #1f2937; background: #f8fafc; }}
+    h1 {{ font-size: 22px; margin: 0 0 12px; }}
+    .meta {{ margin-bottom: 16px; color: #64748b; }}
+    table {{ width: 100%; border-collapse: collapse; background: #fff; }}
+    th, td {{ border: 1px solid #dbe3ef; padding: 8px; text-align: left; vertical-align: top; }}
+    th {{ background: #eef2f7; }}
+    img {{ max-width: 320px; max-height: 220px; object-fit: contain; display: block; }}
+  </style>
+</head>
+<body>
+  <h1>JetCar Task Report</h1>
+  <div class="meta">
+    car={_html_escape(report.get('car_id', ''))}
+    stream={_html_escape(report.get('stream_id', ''))}
+    task={_html_escape(report.get('task_id', ''))}
+    mode={_html_escape(report.get('mode', ''))}
+    results={_html_escape(report.get('result_count', 0))}
+  </div>
+  <table>
+    <thead><tr><th>Algorithm</th><th>Time</th><th>Summary</th><th>Image</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</body>
+</html>
+"""
+
+
+def _html_escape(value) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _read_map_yaml(path: Path) -> dict:
+    try:
+        import yaml
+
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to read map yaml: {exc}") from exc
 
 
 def _copy_algorithm_output_files(outputs: dict, target_dir: Path) -> None:
