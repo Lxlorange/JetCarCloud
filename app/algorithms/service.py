@@ -43,24 +43,31 @@ class AlgorithmService:
         parameters: dict | None = None,
         include_image: bool = False,
     ) -> AlgorithmRunResult:
+        parameters = dict(parameters or {})
+        persist_outputs = bool(parameters.pop("persist_outputs", True))
         spec = self._catalog.require(algorithm_id)
         run_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
         run_dir = self._work_dir / algorithm_id / run_id
         input_dir = run_dir / "input"
         output_dir = run_dir / "output"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if persist_outputs:
+            input_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-        _write_frame(input_dir / "frame.jpg", image)
         request = {
             "algorithm_id": algorithm_id,
             "car_id": car_id,
             "stream_id": stream_id,
-            "parameters": parameters or {},
+            "parameters": parameters,
             "input_dir": "/app/data/input",
             "output_dir": "/app/data/output",
         }
-        (input_dir / "request.json").write_text(json.dumps(request, ensure_ascii=False, indent=2), encoding="utf-8")
+        if persist_outputs:
+            _write_frame(input_dir / "frame.jpg", image)
+            (input_dir / "request.json").write_text(
+                json.dumps(request, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
         started = time.perf_counter()
         result_json: dict
@@ -78,9 +85,10 @@ class AlgorithmService:
                     stream_id=stream_id,
                     parameters=parameters,
                 )
-                _write_json(output_dir / "result.json", result_json)
-                if annotated is not None:
-                    _write_frame(output_dir / "annotated.jpg", annotated)
+                if persist_outputs:
+                    _write_json(output_dir / "result.json", result_json)
+                    if annotated is not None:
+                        _write_frame(output_dir / "annotated.jpg", annotated)
                 runner_outputs = {
                     "runner": "local",
                     "returncode": 0,
@@ -96,7 +104,8 @@ class AlgorithmService:
                     "stream_id": stream_id,
                     "error": str(exc),
                 }
-                _write_json(output_dir / "result.json", result_json)
+                if persist_outputs:
+                    _write_json(output_dir / "result.json", result_json)
                 runner_outputs = {
                     "runner": "local",
                     "returncode": 1,
@@ -127,12 +136,13 @@ class AlgorithmService:
         if include_image and annotated is not None:
             annotated_image = encode_jpeg_payload(annotated)
 
-        input_files = _list_files(input_dir)
-        output_files = _list_files(output_dir)
+        input_files = _list_files(input_dir) if persist_outputs else []
+        output_files = _list_files(output_dir) if persist_outputs else []
         outputs = {
             "run_dir": str(run_dir),
             "input_dir": str(input_dir),
             "output_dir": str(output_dir),
+            "persist_outputs": persist_outputs,
             "input_frame_shape": [int(item) for item in image.shape],
             "input_files": input_files,
             "output_files": output_files,
@@ -141,11 +151,13 @@ class AlgorithmService:
         outputs.update(runner_outputs)
         for name in spec.outputs:
             path = output_dir / name
-            if path.exists():
+            if persist_outputs and path.exists():
                 outputs[name] = str(path)
-            else:
+            elif persist_outputs:
                 outputs[name] = ""
                 outputs["missing_outputs"].append(name)
+            else:
+                outputs[name] = ""
 
         return AlgorithmRunResult(
             ok=ok,

@@ -90,6 +90,8 @@ class ProcessedFrameCacheItem:
 processed_frames: dict[tuple[str, str, str], ProcessedFrameCacheItem] = {}
 processing_tasks: set[asyncio.Task] = set()
 processing_tasks_by_key: dict[tuple[str, str, str], asyncio.Task] = {}
+pending_algorithm_frames: dict[tuple[str, str, str], dict] = {}
+pending_retry_tasks: set[tuple[str, str, str]] = set()
 algorithm_last_started_at: dict[tuple[str, str, str], float] = {}
 debug_dump_dir = Path(settings.debug_dump_dir)
 reports_dir = Path(settings.reports_dir)
@@ -1109,7 +1111,10 @@ def _queue_algorithms_for_frame(
     skipped: list[dict] = []
     for algorithm_id in algorithm_ids:
         key = (car_id, stream_id, algorithm_id)
-        parameters = {"preprocess": frame.metadata.model_dump(mode="json")}
+        parameters = {
+            "preprocess": frame.metadata.model_dump(mode="json"),
+            "persist_outputs": settings.algorithm_realtime_persist_outputs,
+        }
         if algorithm_id == "yolov5-similarity":
             session = similarity_sessions.get(key)
             if session is None or not session.get("active"):
@@ -1125,15 +1130,32 @@ def _queue_algorithms_for_frame(
 
         running = processing_tasks_by_key.get(key)
         if running is not None and not running.done():
-            skipped.append({"algorithm_id": algorithm_id, "reason": "algorithm_busy"})
+            pending_algorithm_frames[key] = {
+                "frame": frame,
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "algorithm_id": algorithm_id,
+                "parameters": parameters,
+                "include_image": include_image,
+            }
+            skipped.append({"algorithm_id": algorithm_id, "reason": "algorithm_busy_latest_frame_kept"})
             continue
 
         active_tasks = sum(1 for task in processing_tasks if not task.done())
         if active_tasks >= settings.algorithm_max_concurrent_tasks:
+            pending_algorithm_frames[key] = {
+                "frame": frame,
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "algorithm_id": algorithm_id,
+                "parameters": parameters,
+                "include_image": include_image,
+            }
+            _schedule_pending_retry(key, delay_seconds=0.1)
             skipped.append(
                 {
                     "algorithm_id": algorithm_id,
-                    "reason": "global_algorithm_limit",
+                    "reason": "global_algorithm_limit_latest_frame_kept",
                     "active_tasks": active_tasks,
                     "limit": settings.algorithm_max_concurrent_tasks,
                 }
@@ -1144,32 +1166,100 @@ def _queue_algorithms_for_frame(
         min_interval = settings.algorithm_min_interval_ms / 1000.0
         last_started = algorithm_last_started_at.get(key, 0.0)
         if min_interval > 0 and now - last_started < min_interval:
+            retry_after_seconds = max(0.0, min_interval - (now - last_started))
+            pending_algorithm_frames[key] = {
+                "frame": frame,
+                "car_id": car_id,
+                "stream_id": stream_id,
+                "algorithm_id": algorithm_id,
+                "parameters": parameters,
+                "include_image": include_image,
+            }
+            _schedule_pending_retry(key, delay_seconds=retry_after_seconds)
             skipped.append(
                 {
                     "algorithm_id": algorithm_id,
-                    "reason": "algorithm_rate_limited",
-                    "retry_after_ms": int(max(0.0, min_interval - (now - last_started)) * 1000),
+                    "reason": "algorithm_rate_limited_latest_frame_kept",
+                    "retry_after_ms": int(retry_after_seconds * 1000),
                 }
             )
             continue
 
-        algorithm_last_started_at[key] = now
-        task = asyncio.create_task(
-            _run_algorithm_for_pushed_frame(
-                frame=frame,
-                car_id=car_id,
-                stream_id=stream_id,
-                algorithm_id=algorithm_id,
-                parameters=parameters,
-                include_image=include_image,
-            )
+        _start_algorithm_task(
+            key=key,
+            frame=frame,
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            parameters=parameters,
+            include_image=include_image,
         )
-        processing_tasks.add(task)
-        processing_tasks_by_key[key] = task
-        task.add_done_callback(processing_tasks.discard)
-        task.add_done_callback(lambda completed, task_key=key: processing_tasks_by_key.pop(task_key, None))
         queued.append(algorithm_id)
     return queued, skipped
+
+
+def _start_algorithm_task(
+    *,
+    key: tuple[str, str, str],
+    frame,
+    car_id: str,
+    stream_id: str,
+    algorithm_id: str,
+    parameters: dict,
+    include_image: bool,
+) -> None:
+    algorithm_last_started_at[key] = time.monotonic()
+    task = asyncio.create_task(
+        _run_algorithm_for_pushed_frame(
+            frame=frame,
+            car_id=car_id,
+            stream_id=stream_id,
+            algorithm_id=algorithm_id,
+            parameters=parameters,
+            include_image=include_image,
+        )
+    )
+    processing_tasks.add(task)
+    processing_tasks_by_key[key] = task
+    task.add_done_callback(lambda completed, task_key=key: _on_algorithm_task_done(completed, task_key))
+
+
+def _on_algorithm_task_done(completed: asyncio.Task, task_key: tuple[str, str, str]) -> None:
+    processing_tasks.discard(completed)
+    if processing_tasks_by_key.get(task_key) is completed:
+        processing_tasks_by_key.pop(task_key, None)
+    pending = pending_algorithm_frames.pop(task_key, None)
+    if pending is None:
+        return
+    active_tasks = sum(1 for task in processing_tasks if not task.done())
+    if active_tasks >= settings.algorithm_max_concurrent_tasks:
+        pending_algorithm_frames[task_key] = pending
+        _schedule_pending_retry(task_key, delay_seconds=0.1)
+        return
+    _start_algorithm_task(key=task_key, **pending)
+
+
+def _schedule_pending_retry(task_key: tuple[str, str, str], *, delay_seconds: float) -> None:
+    if task_key in pending_retry_tasks:
+        return
+    pending_retry_tasks.add(task_key)
+    asyncio.create_task(_retry_pending_algorithm(task_key, delay_seconds=delay_seconds))
+
+
+async def _retry_pending_algorithm(task_key: tuple[str, str, str], *, delay_seconds: float) -> None:
+    await asyncio.sleep(delay_seconds)
+    pending_retry_tasks.discard(task_key)
+    if task_key in processing_tasks_by_key:
+        return
+    pending = pending_algorithm_frames.pop(task_key, None)
+    if pending is None:
+        return
+    active_tasks = sum(1 for task in processing_tasks if not task.done())
+    if active_tasks >= settings.algorithm_max_concurrent_tasks:
+        pending_algorithm_frames[task_key] = pending
+        _schedule_pending_retry(task_key, delay_seconds=delay_seconds)
+        return
+    _start_algorithm_task(key=task_key, **pending)
 
 
 def _throttled_push_result(

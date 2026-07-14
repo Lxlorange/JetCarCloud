@@ -22,16 +22,17 @@ class Settings(BaseSettings):
     video_default_height: int = Field(default=640, ge=64)
     video_default_fps: float = Field(default=2.0, ge=0.1, le=30.0)
     video_capture_timeout_ms: int = Field(default=5000, ge=100)
-    video_push_min_interval_ms: int = Field(default=200, ge=0)
-    algorithm_min_interval_ms: int = Field(default=500, ge=0)
-    algorithm_max_concurrent_tasks: int = Field(default=2, ge=1)
+    video_push_min_interval_ms: int = Field(default=250, ge=0)
+    algorithm_min_interval_ms: int = Field(default=250, ge=0)
+    algorithm_max_concurrent_tasks: int = Field(default=1, ge=1)
+    algorithm_realtime_persist_outputs: bool = False
     algorithm_catalog_path: str = "algorithms.json"
     algorithm_work_dir: str = ".jetcar_algorithm_runs"
     docker_executable: str = "docker"
-    debug_dump_enabled: bool = True
+    debug_dump_enabled: bool = False
     debug_dump_dir: str = ".jetcar_debug"
-    debug_save_images: bool = True
-    debug_save_algorithm_outputs: bool = True
+    debug_save_images: bool = False
+    debug_save_algorithm_outputs: bool = False
     debug_dump_skipped_frames: bool = False
     reports_dir: str = ".jetcar_reports"
     map_dir: str = ".jetcar_maps"

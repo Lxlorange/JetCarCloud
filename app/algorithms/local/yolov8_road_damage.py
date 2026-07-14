@@ -37,6 +37,7 @@ class Yolov8RoadDamageAlgorithm:
         imgsz = int(parameters.get("imgsz", spec.metadata.get("imgsz", 640)))
         conf = float(parameters.get("conf", spec.metadata.get("conf", 0.20)))
         iou = float(parameters.get("iou", spec.metadata.get("iou", 0.45)))
+        max_det = int(parameters.get("max_det", spec.metadata.get("max_det", 50)))
         device = str(parameters.get("device", spec.metadata.get("device", "cpu")))
 
         kwargs = {
@@ -44,6 +45,7 @@ class Yolov8RoadDamageAlgorithm:
             "imgsz": imgsz,
             "conf": conf,
             "iou": iou,
+            "max_det": max_det,
             "verbose": False,
         }
         if device.lower() != "auto":
@@ -66,7 +68,7 @@ class Yolov8RoadDamageAlgorithm:
                 "detection_count": len(detections),
                 "class_summary": dict(Counter(item["class_name"] for item in detections)),
                 "detections": detections,
-                "config": {"imgsz": imgsz, "conf": conf, "iou": iou, "device": device},
+                "config": {"imgsz": imgsz, "conf": conf, "iou": iou, "max_det": max_det, "device": device},
             },
             annotated,
         )

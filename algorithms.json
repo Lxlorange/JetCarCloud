@@ -27,9 +27,10 @@
         "task": "manhole_detection",
         "model_path": "models/yolov5-manhole/Manhole_model.pt",
         "source_dir": "models/yolov5-manhole/src",
-        "img_size": 640,
-        "conf_threshold": 0.25,
+        "img_size": 512,
+        "conf_threshold": 0.18,
         "iou_threshold": 0.45,
+        "max_det": 50,
         "device": ""
       }
     },
@@ -44,10 +45,11 @@
       "metadata": {
         "task": "road_damage_detection",
         "model_path": "models/yolov8-road-damage/YOLOv8_Small_2nd_Model.pt",
-        "imgsz": 640,
-        "conf": 0.2,
+        "imgsz": 512,
+        "conf": 0.16,
         "iou": 0.45,
-        "device": "cpu"
+        "max_det": 50,
+        "device": "auto"
       }
     }
   }
